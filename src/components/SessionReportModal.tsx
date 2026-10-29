@@ -37,18 +37,25 @@ export const SessionReportModal: React.FC<SessionReportModalProps> = ({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          messages: messages.map((m) => ({ role: m.role, text: m.text })),
+          messages: messages.map((m) => ({
+            role: m.role,
+            text: m.text,
+            feedback: m.feedback,
+          })),
           scenarioTitle,
           level,
         }),
       });
+
       if (!res.ok) {
-        throw new Error('Falha ao gerar relatório pedagógico.');
+        const errJson = await res.json().catch(() => null);
+        throw new Error(errJson?.error || 'Falha ao gerar relatório pedagógico.');
       }
+
       const data = await res.json();
       setReport(data);
     } catch (err: any) {
-      console.error(err);
+      console.error('Session report generation error:', err);
       setError(err.message || 'Erro ao processar dados da sessão');
     } finally {
       setLoading(false);

@@ -37,7 +37,7 @@ export class SpeechRecognizer {
     if (!SpeechRecognitionClass) return;
 
     this.recognition = new SpeechRecognitionClass();
-    this.recognition.continuous = false;
+    this.recognition.continuous = true;
     this.recognition.interimResults = true;
     this.recognition.lang = this.lang;
     this.recognition.maxAlternatives = 1;
@@ -121,6 +121,40 @@ export class SpeechRecognizer {
   }
 }
 
+// Pre-unlocked audio instance for mobile browsers (iOS Safari / Android Chrome)
+let sharedAudioElement: HTMLAudioElement | null = null;
+let audioContextUnlocked = false;
+
+/**
+ * Prime and unlock audio capabilities on mobile devices during a direct user touch/click gesture.
+ * This ensures that subsequent asynchronous playback from server responses is not blocked by browser autoplay policy.
+ */
+export function unlockMobileAudio() {
+  if (typeof window === 'undefined') return;
+  if (!sharedAudioElement) {
+    sharedAudioElement = new Audio();
+  }
+
+  if (!audioContextUnlocked) {
+    try {
+      // Play a tiny silent data URI to unlock audio on iOS and Android
+      sharedAudioElement.src = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAA==';
+      const playPromise = sharedAudioElement.play();
+      if (playPromise !== undefined) {
+        playPromise
+          .then(() => {
+            audioContextUnlocked = true;
+          })
+          .catch(() => {
+            // Browser might still require explicit click on play button
+          });
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+}
+
 // Global audio player manager
 class GlobalAudioPlayer {
   private currentAudio: HTMLAudioElement | null = null;
@@ -132,11 +166,14 @@ class GlobalAudioPlayer {
       try {
         this.currentAudio.pause();
         this.currentAudio.currentTime = 0;
+        this.currentAudio.src = '';
       } catch (e) {}
       this.currentAudio = null;
     }
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
+      try {
+        window.speechSynthesis.cancel();
+      } catch (e) {}
       this.currentUtterance = null;
     }
     if (this.onEndCallback) {
@@ -146,30 +183,37 @@ class GlobalAudioPlayer {
     }
   }
 
-  public play(
+  public isPlaying(): boolean {
+    return !!this.currentAudio && !this.currentAudio.paused;
+  }
+
+  public async play(
     text: string,
     audioBase64?: string | null,
     options: {
       rate?: number;
       accent?: string;
+      voiceId?: string;
+      allowBrowserFallback?: boolean;
       onEnd?: () => void;
       onError?: (err: any) => void;
     } = {}
-  ) {
+  ): Promise<void> {
     this.stop();
     this.onEndCallback = options.onEnd || null;
 
     const rate = options.rate || 1.0;
 
-    // 1. If we have Gemini generated audio base64, play it
+    // 1. If we have Gemini generated audio base64, play it with high fidelity
     if (audioBase64) {
       try {
         const audioSrc = audioBase64.startsWith('data:')
           ? audioBase64
           : `data:audio/wav;base64,${audioBase64}`;
 
-        const audio = new Audio(audioSrc);
-        audio.playbackRate = rate;
+        const audio = sharedAudioElement || new Audio();
+        audio.src = audioSrc;
+        audio.playbackRate = Math.max(0.5, Math.min(2.0, rate));
         this.currentAudio = audio;
 
         audio.onended = () => {
@@ -182,23 +226,70 @@ class GlobalAudioPlayer {
         };
 
         audio.onerror = (e) => {
-          console.warn('WAV playback failed, fallback to Web Speech:', e);
-          this.playWebSpeech(text, rate, options.accent, options.onEnd);
+          console.warn('Neural audio playback failed:', e);
+          this.currentAudio = null;
+          options.onError?.(e);
+          if (this.onEndCallback) {
+            const cb = this.onEndCallback;
+            this.onEndCallback = null;
+            cb();
+          }
         };
 
-        audio.play().catch((err) => {
-          console.warn('Autoplay blocked or audio failed, fallback to Web Speech:', err);
-          this.playWebSpeech(text, rate, options.accent, options.onEnd);
-        });
+        const playPromise = audio.play();
+        if (playPromise !== undefined) {
+          playPromise.catch((err) => {
+            console.warn('Mobile autoplay blocked or audio play failed:', err);
+            this.currentAudio = null;
+            options.onError?.(err);
+            if (this.onEndCallback) {
+              const cb = this.onEndCallback;
+              this.onEndCallback = null;
+              cb();
+            }
+          });
+        }
 
         return;
       } catch (err) {
         console.warn('Error initiating audio element:', err);
+        options.onError?.(err);
+        return;
       }
     }
 
-    // 2. Fallback to Web Speech API
-    this.playWebSpeech(text, rate, options.accent, options.onEnd);
+    // 2. If no audioBase64 was provided but we have text, fetch high-quality TTS from /api/tts
+    try {
+      const res = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text,
+          voiceId: options.voiceId || 'alex',
+          accent: options.accent || 'American',
+        }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        if (data.audioBase64) {
+          return this.play(text, data.audioBase64, options);
+        }
+      }
+    } catch (apiErr) {
+      console.warn('Dedicated TTS fetch failed:', apiErr);
+    }
+
+    // 3. Fallback to Web Speech ONLY if explicitly allowed by user settings (never forced on mobile)
+    if (options.allowBrowserFallback) {
+      this.playWebSpeech(text, rate, options.accent, options.onEnd);
+    } else {
+      if (this.onEndCallback) {
+        const cb = this.onEndCallback;
+        this.onEndCallback = null;
+        cb();
+      }
+    }
   }
 
   private playWebSpeech(
@@ -216,7 +307,6 @@ class GlobalAudioPlayer {
     utterance.rate = Math.max(0.7, Math.min(1.5, rate));
     utterance.pitch = 1.0;
 
-    // Select suitable voice
     const voices = window.speechSynthesis.getVoices();
     let targetLang = 'en-US';
     if (accent === 'British') targetLang = 'en-GB';

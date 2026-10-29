@@ -30,6 +30,7 @@ import {
   isSpeechRecognitionSupported,
   SpeechRecognizer,
   audioPlayer,
+  unlockMobileAudio,
 } from './utils/speech';
 import {
   loadSettings,
@@ -151,6 +152,7 @@ export default function App() {
   // Refs
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const recognizerRef = useRef<SpeechRecognizer | null>(null);
+  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   // Current session key for persistence
   const currentSessionKey = mode === 'free_tutor' ? 'free_tutor' : `scenario_${activeScenario.id}`;
@@ -295,8 +297,9 @@ export default function App() {
     setSessionStarted(`scenario_${activeScenario.id}`, true);
   };
 
-  // Toggle Voice Input
+  // Toggle Voice Input with generous pause patience
   const toggleListening = () => {
+    unlockMobileAudio();
     if (!isSpeechRecognitionSupported()) {
       alert(
         'O reconhecimento de voz pelo microfone não está habilitado neste navegador. Você pode digitar sua resposta normalmente na caixa de texto!'
@@ -305,31 +308,73 @@ export default function App() {
     }
 
     if (isListening) {
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+        silenceTimerRef.current = null;
+      }
       recognizerRef.current?.stop();
       setIsListening(false);
       setInterimTranscript('');
       return;
     }
 
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+
     setInterimTranscript('');
     recognizerRef.current?.start({
-      onStart: () => setIsListening(true),
-      onInterimResult: (interim) => setInterimTranscript(interim),
+      onStart: () => {
+        setIsListening(true);
+        // Start silence timer of 4 seconds after opening mic if nothing spoken yet
+        silenceTimerRef.current = setTimeout(() => {
+          recognizerRef.current?.stop();
+          setIsListening(false);
+          setInterimTranscript('');
+        }, 5000);
+      },
+      onInterimResult: (interim) => {
+        setInterimTranscript(interim);
+        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+        // Keep listening while speaking, allow up to 3.5 seconds of pause between words
+        silenceTimerRef.current = setTimeout(() => {
+          recognizerRef.current?.stop();
+          setIsListening(false);
+          setInterimTranscript('');
+        }, 3500);
+      },
       onFinalResult: (final) => {
-        setIsListening(false);
         setInterimTranscript('');
-        setInputText((prev) => (prev ? `${prev} ${final}` : final));
+        if (final && final.trim()) {
+          setInputText((prev) => (prev ? `${prev.trim()} ${final.trim()}` : final.trim()));
+        }
+        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+        // Give 3.5 seconds of thinking/pause time before automatically closing the mic
+        silenceTimerRef.current = setTimeout(() => {
+          recognizerRef.current?.stop();
+          setIsListening(false);
+          setInterimTranscript('');
+        }, 3500);
       },
       onError: (err) => {
+        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
         setIsListening(false);
         setInterimTranscript('');
         console.warn('Speech error:', err);
       },
       onEnd: () => {
+        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
         setIsListening(false);
         setInterimTranscript('');
       },
     });
+  };
+
+  // Stop current audio cleanly
+  const handleStopAudio = () => {
+    audioPlayer.stop();
+    setCurrentlyPlayingId(null);
   };
 
   // Audio Playback
@@ -339,31 +384,45 @@ export default function App() {
     audioBase64?: string | null,
     customSpeed?: number
   ) => {
-    if (currentlyPlayingId === id && !customSpeed) {
-      audioPlayer.stop();
-      setCurrentlyPlayingId(null);
+    unlockMobileAudio();
+
+    // If already playing this message and user clicked play without asking for a different speed, STOP!
+    if (currentlyPlayingId === id && (!customSpeed || customSpeed === playbackSpeed)) {
+      handleStopAudio();
       return;
     }
 
+    audioPlayer.stop();
     setCurrentlyPlayingId(id);
     const speed = customSpeed || playbackSpeed;
 
     audioPlayer.play(text, audioBase64, {
       rate: speed,
       accent,
+      voiceId,
       onEnd: () => setCurrentlyPlayingId(null),
-      onError: () => setCurrentlyPlayingId(null),
+      onError: (err) => {
+        console.warn('Audio playback error:', err);
+        setCurrentlyPlayingId(null);
+      },
     });
   };
 
   // Send message to IAlex server API
   const handleSendMessage = async (textToSend?: string) => {
+    unlockMobileAudio();
     const text = (textToSend || inputText).trim();
     if (!text || isLoadingReply) return;
+
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
 
     if (isListening) {
       recognizerRef.current?.stop();
       setIsListening(false);
+      setInterimTranscript('');
     }
 
     const userMsg: Message = {
@@ -552,7 +611,7 @@ export default function App() {
       />
 
       {/* Main Container */}
-      <main className="flex-1 max-w-4xl w-full mx-auto p-3 sm:p-4 md:p-6 flex flex-col justify-between">
+      <main className="flex-1 max-w-4xl w-full mx-auto p-2 sm:p-4 md:p-6 flex flex-col justify-between">
         {/* If Mode is NOT started yet, show dedicated Lobby with START button! */}
         {!isCurrentModeStarted ? (
           mode === 'free_tutor' ? (
@@ -576,80 +635,108 @@ export default function App() {
         ) : (
           /* Active Chat Stream */
           <div className="flex-1 flex flex-col justify-between">
-            {/* Context Header Bar */}
-            <div className="mb-4">
+            {/* Unified Context & Controls Bar */}
+            <div className="mb-3">
               {mode === 'free_tutor' ? (
-                <div className="p-3.5 rounded-2xl bg-gradient-to-r from-indigo-600 via-indigo-700 to-sky-600 text-white shadow-md flex items-center justify-between gap-3">
-                  <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-2xl bg-white/20 backdrop-blur-md flex items-center justify-center text-white shrink-0 font-bold">
+                <div className="px-3 py-2.5 rounded-2xl bg-white border border-slate-200/90 shadow-xs flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-indigo-600 via-indigo-500 to-sky-500 text-white flex items-center justify-center font-bold text-xs shrink-0 shadow-xs">
                       {tutorName.slice(0, 2).toUpperCase()}
                     </div>
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <h2 className="text-sm font-bold">Modo Tutor Livre com {tutorName}</h2>
-                        <span className="px-2 py-0.2 rounded-full bg-emerald-400 text-slate-900 text-[10px] font-black uppercase">
-                          Ativo
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <h2 className="text-xs sm:text-sm font-bold text-slate-900 leading-none">
+                          Tutor {tutorName}
+                        </h2>
+                        <span className="inline-flex items-center px-1.5 py-0.2 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-[10px] font-bold">
+                          Online
                         </span>
                       </div>
-                      <p className="text-xs text-indigo-100 mt-0.5">
-                        Conversa leve e aberta. {tutorName} explica dúvidas de gramática e vocabulário rapidinho em português!
+                      <p className="text-[11px] text-slate-500 mt-0.5 truncate">
+                        Conversa livre • Nível {level}
                       </p>
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 shrink-0">
                     <button
-                      onClick={() => setIsScenarioModalOpen(true)}
-                      className="px-3 py-1.5 rounded-xl bg-white/20 hover:bg-white/30 text-white text-xs font-semibold backdrop-blur-sm transition-all shrink-0 flex items-center gap-1.5"
+                      onClick={() => setShowTranslations(!showTranslations)}
+                      className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold transition-all ${
+                        showTranslations
+                          ? 'bg-indigo-50 text-indigo-700 border border-indigo-200'
+                          : 'bg-slate-50 text-slate-600 hover:bg-slate-100 border border-slate-200'
+                      }`}
+                      title="Alternar legendas e traduções das respostas"
                     >
-                      <Compass className="w-3.5 h-3.5" />
-                      <span className="hidden sm:inline">Cenários</span>
+                      <Globe2 className="w-3.5 h-3.5 text-indigo-600" />
+                      <span className="hidden sm:inline">Tradução PT:</span>
+                      <span>{showTranslations ? 'ON' : 'OFF'}</span>
                     </button>
                   </div>
                 </div>
               ) : (
-                <div className="p-3.5 rounded-2xl bg-white border border-slate-200/80 shadow-sm space-y-2">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="flex items-center gap-2.5">
-                      <div className="p-2 rounded-xl bg-indigo-50 text-indigo-600">
+                <div className="p-3 rounded-2xl bg-white border border-slate-200/90 shadow-xs space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <div className="w-8 h-8 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center shrink-0">
                         <Compass className="w-4 h-4" />
                       </div>
-                      <div>
-                        <span className="text-[10px] font-bold uppercase tracking-wider text-indigo-600">
-                          Cenário Guiado Ativo
-                        </span>
-                        <h3 className="text-sm font-bold text-slate-900 leading-none">
-                          {activeScenario.title} ({activeScenario.titleEn})
-                        </h3>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1.5">
+                          <h3 className="text-xs sm:text-sm font-bold text-slate-900 leading-none truncate">
+                            {activeScenario.title}
+                          </h3>
+                          <span className="inline-flex items-center px-1.5 py-0.2 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200 text-[10px] font-bold shrink-0">
+                            {level}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 mt-0.5 truncate">
+                          {activeScenario.partnerRole.split(',')[0]} ({tutorName})
+                        </p>
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {activeScenario.missionGoals && activeScenario.missionGoals.length > 0 && (
+                        <button
+                          onClick={() => setShowGoals(!showGoals)}
+                          className="px-2 py-1 rounded-xl bg-slate-50 hover:bg-slate-100 text-slate-600 text-xs font-medium border border-slate-200 flex items-center gap-1 transition-colors"
+                        >
+                          <span>Metas</span>
+                          {showGoals ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                        </button>
+                      )}
+
                       <button
-                        onClick={() => setShowGoals(!showGoals)}
-                        className="text-xs text-slate-500 hover:text-slate-800 flex items-center gap-1 font-medium"
+                        onClick={() => setShowTranslations(!showTranslations)}
+                        className={`flex items-center gap-1 px-2.5 py-1 rounded-xl text-xs font-semibold transition-all ${
+                          showTranslations
+                            ? 'bg-indigo-50 text-indigo-700 border border-indigo-200'
+                            : 'bg-slate-50 text-slate-600 hover:bg-slate-100 border border-slate-200'
+                        }`}
+                        title="Alternar legendas e traduções"
                       >
-                        <span>Objetivos</span>
-                        {showGoals ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                        <Globe2 className="w-3.5 h-3.5 text-indigo-600" />
+                        <span>{showTranslations ? 'ON' : 'OFF'}</span>
                       </button>
 
                       <button
                         onClick={() => setIsScenarioModalOpen(true)}
-                        className="px-2.5 py-1 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold transition-colors"
+                        className="px-2.5 py-1 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold transition-colors shadow-xs"
                       >
-                        Trocar Cenário
+                        Trocar
                       </button>
                     </div>
                   </div>
 
                   {showGoals && activeScenario.missionGoals && (
-                    <div className="pt-2 border-t border-slate-100 flex flex-wrap gap-2 text-xs">
+                    <div className="pt-2 border-t border-slate-100 flex flex-wrap gap-1.5 text-xs">
                       {activeScenario.missionGoals.map((goal, i) => (
                         <div
                           key={i}
-                          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-50 border border-slate-200 text-slate-700 text-[11px]"
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-50 border border-slate-200 text-slate-700 text-[11px]"
                         >
-                          <CheckCircle2 className="w-3.5 h-3.5 text-indigo-500" />
+                          <CheckCircle2 className="w-3.5 h-3.5 text-indigo-500 shrink-0" />
                           <span>{goal}</span>
                         </div>
                       ))}
@@ -657,29 +744,6 @@ export default function App() {
                   )}
                 </div>
               )}
-            </div>
-
-            {/* Global Toolbar Bar: Translations & Speed Indicator */}
-            <div className="flex items-center justify-between mb-3 px-1 text-xs text-slate-500">
-              <div className="flex items-center gap-3">
-                <button
-                  onClick={() => setShowTranslations(!showTranslations)}
-                  className={`flex items-center gap-1.5 px-2 py-1 rounded-lg font-medium transition-all ${
-                    showTranslations
-                      ? 'text-indigo-600 bg-indigo-50 border border-indigo-200'
-                      : 'text-slate-500 hover:text-slate-700'
-                  }`}
-                >
-                  <Globe2 className="w-3.5 h-3.5" />
-                  <span>{showTranslations ? 'Traduções PT ativadas' : 'Ocultar traduções'}</span>
-                </button>
-              </div>
-
-              <div className="flex items-center gap-2">
-                <span className="text-[11px] text-slate-400">
-                  Velocidade da fala: <strong className="text-slate-700">{playbackSpeed}x</strong>
-                </span>
-              </div>
             </div>
 
             {/* Message Stream */}
@@ -743,14 +807,18 @@ export default function App() {
                           <div className="flex items-center gap-1.5">
                             {/* Play / Stop Button */}
                             <button
-                              onClick={() =>
-                                handlePlayAudio(
-                                  message.id,
-                                  message.text,
-                                  message.audioBase64,
-                                  playbackSpeed
-                                )
-                              }
+                              onClick={() => {
+                                if (isPlayingThis) {
+                                  handleStopAudio();
+                                } else {
+                                  handlePlayAudio(
+                                    message.id,
+                                    message.text,
+                                    message.audioBase64,
+                                    playbackSpeed
+                                  );
+                                }
+                              }}
                               className={`flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-xs font-semibold transition-all ${
                                 isPlayingThis
                                   ? 'bg-rose-50 text-rose-600 border border-rose-200'
@@ -878,7 +946,7 @@ export default function App() {
                     label={
                       interimTranscript
                         ? `"${interimTranscript}"`
-                        : `Pode falar em inglês... ${tutorName} está ouvindo!`
+                        : `Ouvindo com calma... Pode pausar para pensar, ou clique no botão para encerrar.`
                     }
                   />
                 </div>

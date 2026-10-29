@@ -1,6 +1,6 @@
 {
-  "summary":  "Plano de implementação para o sistema de Memória Contínua e Perfil do Estudante (Long-Term Memory). O sistema permite ao tutor registrar automaticamente novos fatos e detalhes pessoais durante o diálogo, disponibiliza uma central visual para edição de dados pessoais e anotações livres, injeta o perfil consolidado em todas as conversas e sincroniza a memória com o Google Drive.",
-  "updatedAt":  "2026-10-29T18:01:03.594680084Z",
+  "summary":  "Plano de aprimoramento atualizado para incluir a correção do botão 'Parar':\n- Correção do botão Parar/Stop: remoção da condição que fazia o áudio reiniciar em vez de interromper a reprodução imediata.\n- Ajuste de pronúncia bilíngue (Code-Switching) com cadência e pontuação natural.\n- Paridade mobile absoluta: áudio neural idêntico ao desktop e desbloqueio de autoplay no toque do usuário.\n- Remoção definitiva do fallback para voz mecânica do Google Tradutor.",
+  "updatedAt":  "2026-10-29T22:07:40.313418587Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

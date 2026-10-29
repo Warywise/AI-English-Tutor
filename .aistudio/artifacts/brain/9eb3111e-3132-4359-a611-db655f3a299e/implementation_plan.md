@@ -1,76 +1,63 @@
-# Learner Long-Term Memory & Personalized Student Profile
+# Plano de Aprimoramento de Áudio Bilíngue, Paridade Mobile e Correção do Botão Parar
 
-Plano de arquitetura e implementação para dotar o tutor pessoal de inglês de **memória contínua de longo prazo (Long-Term Memory)** e um **Perfil Pessoal do Estudante**. O tutor agora recordará a profissão, rotina, gostos, objetivos e peculiaridades do usuário ao longo dos dias, mantendo um vínculo afetivo e pedagógico hiperpersonalizado em todos os modos e sincronizado remotamente no Google Drive.
+Este plano resolve os problemas identificados:
+1. **Pronúncia embolada** ao misturar inglês e português no áudio.
+2. **Degradação de voz no celular** para o sintetizador mecânico do Google Tradutor.
+3. **Comportamento do botão "Parar"**, que atualmente reiniciava o áudio do início em vez de interromper a reprodução.
 
 ---
 
 ### User Review & Critical Decisions
 
 > [!IMPORTANT]
-> **Decisões confirmadas pelo usuário:**
-> 1. **Gravação Automática com Curadoria Manual**: O tutor detectará e extrairá novos fatos e detalhes pessoais em tempo de conversa, além de fornecer uma central dedicada onde o usuário pode visualizar, ajustar, adicionar e apagar lembranças a qualquer momento.
-> 2. **Presença em Ambos os Modos**: O contexto pessoal do aluno será utilizado tanto no **Modo Livre** (para conversas contínuas sobre rotina e vida real) quanto nos **Cenários Práticos** (para contextualizar simulações, como entrevistas na área profissional real do usuário).
-> 3. **Latência vs. Profundidade**: O usuário priorizou respostas ricas, humanas e atenciosas, aceitando o tempo adicional necessário para o modelo sintetizar a memória persistente e gerar conselhos pedagógicos sob medida.
+> **Decisões confirmadas e novos itens incorporados:**
+> 1. **Code-Switching com Fonética e Pausas Ajustadas**: O tutor manterá o estilo bilíngue nas falas, com pausas estruturadas e estilo vocal orientado no backend para pronunciar explicações em português brasileiro com clareza, sem fonética anglo-saxônica distorcida.
+> 2. **Paridade Absoluta Mobile vs. PC**: O celular reproduzirá a exata mesma voz neural do desktop (Gemini TTS), desbloqueando o contexto de áudio no toque do botão de envio ou microfone e eliminando o fallback mecânico do Google Tradutor.
+> 3. **Correção do Botão "Parar" (Stop)**: Correção da lógica de interrupção em `handlePlayAudio` — atualmente, o valor de `playbackSpeed` passado como parâmetro anulava a verificação `!customSpeed`, fazendo o player recomeçar do segundo zero em vez de pausar.
 
 ---
 
 ### 1. Overview & Core Concept
 
-- **O que faz**:
-  Transforma o tutor de um assistente sem memória entre sessões em um verdadeiro mentor contínuo. Ele se lembra de onde você mora, no que você trabalha, quais projetos está desenvolvendo, suas dificuldades gramaticais frequentes e seus hobbies. Em conversas futuras, ele puxa assunto naturalmente ("*How is that new software rollout going?*") e utiliza seus interesses para contextualizar explicações de vocabulário.
-- **Público-alvo**:
-  Estudantes e profissionais brasileiros que desejam uma experiência de mentoria particular diária sem precisar repetir quem são ou no que trabalham a cada nova sessão.
-- **Valor central**:
-  Continuidade real de aprendizado e alto engajamento, com total controle do usuário sobre o que está guardado na sua mente digital.
+- **Objetivo**: Garantir uma experiência de áudio consistente, natural e com controle total do usuário tanto no computador quanto no smartphone.
+- **Público-Alvo**: Estudantes brasileiros que utilizam o app em diferentes dispositivos (celular e desktop) e precisam pausar, repetir ou ouvir explicações com clareza fonética.
+- **Valor Principal**: Conversação agradável, controle instantâneo de play/pause e qualidade de estúdio em qualquer tela.
 
 ---
 
 ### 2. User Experience & Visual Design
 
-#### A. Jornada do Usuário
-1. **Acesso à Memória no Cabeçalho**:
-   - Um novo botão elegante **"🧠 Memória do Aluno"** no cabeçalho superior (ao lado do Cofre de Vocabulário e Google Drive), exibindo um indicador numérico de fatos conhecidos pelo tutor.
-2. **Modal / Central de Perfil & Memória**:
-   - **Campos Estruturados**:
-     - *Nome preferido de tratamento* (ex: Gustavo).
-     - *Profissão / Área de Atuação* (ex: Engenheiro de Software / Desenvolvedor).
-     - *Cidade / País* (ex: Curitiba, Brasil).
-     - *Nível e Meta Principal* (ex: Destravar fluência para reuniões com clientes internacionais).
-     - *Hobbies & Interesses* (ex: Música, violão, tecnologia, corrida).
-   - **Fatos Memorizados Automaticamente**:
-     - Lista dinâmica de fatos que o tutor aprendeu durante suas conversas (ex: *"Mencionou que prefere café sem açúcar"*, *"Tem uma apresentação em inglês na próxima sexta-feira"*).
-     - Cada fato possui botão para editar ou excluir individualmente com 1 clique.
-   - **Anotações Livres / Contexto Geral**:
-     - Caixa de texto aberta para o estudante inserir qualquer instrução ou contexto especial que queira que o tutor sempre saiba.
-3. **Detecção e Atualização Suave no Chat**:
-   - Quando o estudante compartilha uma nova informação durante o bate-papo, a resposta da IA retorna opcionalmente uma chave `newMemoryFacts`.
-   - Uma notificação sutil e não intrusiva ("*Alex guardou na memória: Engenheiro de Software*") surge para dar transparência ao que foi aprendido.
-4. **Sincronização em Nuvem**:
-   - A memória faz parte do payload do `SpeakFluent_AI_Backup.json`, subindo automaticamente para o Google Drive do usuário.
+- **Controle Preciso de Reprodução (Play / Pause / Stop)**:
+  - Ao tocar em **"Ouvir"**, o botão se transforma imediatamente no estado visual ativo: **"Parar"** (com ícone `VolumeX` e cor de destaque).
+  - Ao clicar em **"Parar"**, o áudio é imediatamente interrompido, o player é zerado e o botão volta ao estado de repouso ("Ouvir").
+  - Ao clicar no botão de velocidade lenta (🐢 0.75x Lento) durante uma reprodução, o áudio alterna para o ritmo lento sem reiniciar inesperadamente.
 
-#### B. Identidade Visual & Diretrizes Estéticas
-- **Paleta Temática**:
-  - Índigo profundo (`#1E1B4B`), Azul Royal (`#2563EB`) e Violeta suave (`#7C3AED`) para evocar sabedoria, aprendizado e personalização refinada.
-  - Cartões em ardósia neutra com bordas sutis e tipografia nítida (sem pílulas coloridas estáticas ou poluição visual).
-- **Tipografia**:
-  - Títulos elegantes com peso visual SemiBold e corpo de texto com leitura confortável e alto contraste (WCAG AA).
+- **Fluxo Mobile (Toque e Autoplay)**:
+  - O toque do usuário no botão de envio ou microfone executa uma chamada síncrona de desbloqueio (`unlockAudioContext()`).
+  - Quando a resposta do servidor chega com o áudio neural, o navegador móvel (iOS Safari / Android Chrome) executa a reprodução com a mesma voz do PC.
+  - Caso o sistema do celular esteja em modo silencioso físico, o botão de áudio no balão da mensagem permite disparar o áudio manualmente a qualquer momento.
 
 ---
 
 ### 3. Key Product Decisions & Trade-Offs
 
-- **Decisão 1: Formato Híbrido de Memória (Campos Estruturados + Fatos Dinâmicos + Texto Livre)**
-  - *Abordagem escolhida*: Combinar campos chave com uma lista de marcadores dinâmicos e uma caixa de anotações livres.
-  - *Por que*: Oferece o equilíbrio ideal entre precisão (para preencher prompts de forma estruturada) e flexibilidade total para qualquer detalhe inusitado que o aluno queira registrar.
-  - *Alternativa descartada*: Somente texto livre (dificulta a formulação de perguntas focadas pelo modelo) ou apenas campos rígidos (inviabiliza capturar detalhes como "tenho uma viagem marcada para Orlando em novembro").
+#### Decisão 1: Correção do Bug do Botão "Parar"
+- **Diagnóstico**: No componente de mensagem (`App.tsx`), o botão chamava `handlePlayAudio(message.id, message.text, message.audioBase64, playbackSpeed)`. Como `playbackSpeed` (ex.: `1.0`) era passado como 4º argumento (`customSpeed`), a verificação `if (currentlyPlayingId === id && !customSpeed)` falhava (pois `!1.0 === false`). Em vez de pausar, o código executava `audioPlayer.play()`, reiniciando a fala do início.
+- **Solução**:
+  - Criar uma função explícita `handleStopAudio()` ou refatorar `handlePlayAudio` para que, se o áudio clicado já for o `currentlyPlayingId` (com a mesma velocidade ou clique direto no botão Parar), execute `audioPlayer.stop()` e resete o estado imediatamente.
+  - Desacoplar a ação de parar da passagem do parâmetro de velocidade padrão.
 
-- **Decisão 2: Injeção Sintetizada no Backend (`server.ts`)**
-  - *Abordagem escolhida*: O backend sintetiza o perfil em um bloco `STUDENT PROFILE & LONG-TERM MEMORY` nas diretrizes do sistema do Gemini 2.5 Flash.
-  - *Por que*: O modelo processa esse bloco com alta prioridade de atenção, garantindo que ele não sofra de amnésia mesmo ao iniciar um cenário novo ou após centenas de mensagens trocadas.
+#### Decisão 2: Fonética Bilíngue e Pausas Naturais
+- **Abordagem Escolhida**:
+  - Refinar o prompt do sistema para orientar o tutor a usar pontuação cadenciada (travessões e quebras) ao fazer transições de idioma.
+  - Ajustar o `speechMetadata` do Gemini TTS (`gemini-3.8-flash-lite-tts`) com a instrução explícita de estilo vocal: `"Conversational bilingual English tutor speaking with Brazilian learners. Natural English pronunciation and authentic Portuguese pronunciation for quick explanations"`.
+  - Normalizar termos em português para evitar que regras fonéticas inglesas gerem pronúncias truncadas.
 
-- **Decisão 3: Privacidade e Controle Total (Zero Black Box)**
-  - *Abordagem escolhida*: O usuário pode ver cada item individual que a IA memorizou, com botão de lixeira imediato e opção de desativar a gravação automática se preferir.
-  - *Por que*: Segurança, transparência e confiança.
+#### Decisão 3: Paridade Mobile e Remoção do Google Tradutor
+- **Abordagem Escolhida**:
+  - Ampliar o timeout do backend de 4s para 18s em `src/server/app.ts`, garantindo que conexões móveis não descartem o áudio neural.
+  - Implementar o desbloqueador de áudio móvel acionado no toque físico do usuário.
+  - Remover o fallback automático para o `SpeechSynthesis` nativo quando o áudio do Gemini estiver habilitado. Se houver falha de rede, exibir opção de retry com áudio da IA em vez de forçar a voz mecânica do sistema.
 
 ---
 
@@ -78,67 +65,39 @@ Plano de arquitetura e implementação para dotar o tutor pessoal de inglês de 
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│                        INTERFACE DO USUÁRIO                            │
+│                        USER ACTIONS (TOUCH & CLICKS)                   │
 │                                                                        │
-│  ┌───────────────────────┐             ┌────────────────────────────┐  │
-│  │ Header / Controles    │             │ Chat (Livre & Cenários)    │  │
-│  │ [🧠 Memória] [Cofre]  │             │ Mensagens + Feedback       │  │
-│  └───────────┬───────────┘             └─────────────┬──────────────┘  │
-└──────────────┼───────────────────────────────────────┼─────────────────┘
-               │                                       │
-               ▼                                       ▼
+│  [Enviar / Mic] ────► unlockAudio() (Libera autoplay em iOS/Android)   │
+│  [Parar]        ────► handleStopAudio() / audioPlayer.stop()           │
+│                       └─► Interrupção imediata, sem reinício           │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│                   GERENCIADOR DE ESTADO & STORAGE                      │
+│                       BACKEND API (/api/chat)                          │
 │                                                                        │
-│  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │ learnerProfile = {                                               │  │
-│  │   name, occupation, location, goals, hobbies,                    │  │
-│  │   autoLearnedFacts: string[], generalNotes: string               │  │
-│  │ }                                                                │  │
-│  └───────────────────┬───────────────────────────────┬──────────────┘  │
-│                      │                               │                 │
-│         Salva no localStorage            Sincroniza no Google Drive    │
-└──────────────────────┼───────────────────────────────┼─────────────────┘
-                       │                               │
-                       ▼                               ▼
+│  1. Prompt com cadência bilíngue e pontuação natural                   │
+│  2. Gemini TTS com timeout de 18s (evita queda no mobile)             │
+│  3. speechMetadata orientado para dicção bilíngue clara                │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│                       BACKEND (server.ts)                              │
+│                      GLOBAL AUDIO PLAYER (speech.ts)                   │
 │                                                                        │
-│  POST /api/chat {                                                      │
-│    messages, userMessage, scenario, level, tutorName,                  │
-│    learnerProfile: { ... }                                             │
-│  }                                                                     │
-│                                                                        │
-│  Gemini 2.5 Flash Prompt:                                              │
-│  "STUDENT MEMORY CONTEXT:                                              │
-│   Occupation: ..., Goals: ..., Notes: ..., Facts: [...]                │
-│   Use these details to personalize naturally..."                       │
-│                                                                        │
-│  Output JSON:                                                          │
-│  { replyText, feedback, newMemoryFacts: ["..."] }                      │
+│  - Áudio neural WAV base64 do Gemini em HTMLAudioElement               │
+│  - Stop limpo: pause(), currentTime = 0, onEndCallback resetado        │
+│  - Sem fallback forçado para voz robótica do Google Tradutor           │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### Estrutura de Dados do Perfil (`LearnerProfile`)
-```typescript
-interface LearnerProfile {
-  preferredName: string;
-  occupation: string;
-  location: string;
-  primaryGoal: string;
-  interests: string;
-  generalNotes: string;
-  autoLearnedFacts: Array<{
-    id: string;
-    fact: string;
-    createdAt: number;
-  }>;
-  autoExtractEnabled: boolean;
-}
-```
-
-#### Estratégia de Verificação e Teste
-1. **Persistência**: Testar salvamento local e recuperação imediata no recarregamento.
-2. **Integração no Google Drive**: Validar inclusão no arquivo `SpeakFluent_AI_Backup.json`.
-3. **Conversação com Memória**: Testar envio de mensagem mencionando a profissão e verificar se o tutor reconhece e faz alusão ao contexto profissional.
-4. **Auditoria de Código**: Executar compilação com `compile_applet` e `lint_applet` para garantir estabilidade e ausência de regressões.
+#### Arquivos Envolvidos na Execução:
+1. **`src/App.tsx`**:
+   - Correção do `handlePlayAudio` e implementação de toggle limpo de play/stop.
+   - Chamada de desbloqueio de áudio mobile no envio de mensagens e acionamento do microfone.
+2. **`src/utils/speech.ts`**:
+   - Adição do utilitário `unlockMobileAudio()`.
+   - Limpeza do método `stop()` e desativação do fallback que ativava a voz mecânica do sistema.
+3. **`src/server/app.ts`**:
+   - Aumento do timeout de síntese para 18s.
+   - Instruções de estilo bilíngue no prompt e no `speechMetadata`.
