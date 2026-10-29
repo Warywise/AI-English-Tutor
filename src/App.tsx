@@ -153,6 +153,7 @@ export default function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const recognizerRef = useRef<SpeechRecognizer | null>(null);
   const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const baseInputTextRef = useRef<string>('');
 
   // Current session key for persistence
   const currentSessionKey = mode === 'free_tutor' ? 'free_tutor' : `scenario_${activeScenario.id}`;
@@ -297,7 +298,7 @@ export default function App() {
     setSessionStarted(`scenario_${activeScenario.id}`, true);
   };
 
-  // Toggle Voice Input with generous pause patience
+  // Toggle Voice Input with generous pause patience and zero-duplication
   const toggleListening = () => {
     unlockMobileAudio();
     if (!isSpeechRecognitionSupported()) {
@@ -323,39 +324,37 @@ export default function App() {
       silenceTimerRef.current = null;
     }
 
+    // Preserve whatever the user already typed or previous voice snippet
+    baseInputTextRef.current = inputText.trim();
     setInterimTranscript('');
+
     recognizerRef.current?.start({
       onStart: () => {
         setIsListening(true);
-        // Start silence timer of 4 seconds after opening mic if nothing spoken yet
+        // Start patience timer: close after 6 seconds of complete silence
         silenceTimerRef.current = setTimeout(() => {
           recognizerRef.current?.stop();
           setIsListening(false);
           setInterimTranscript('');
-        }, 5000);
+        }, 6000);
       },
-      onInterimResult: (interim) => {
-        setInterimTranscript(interim);
+      onSessionTranscript: (sessionFinal, sessionInterim) => {
+        const base = baseInputTextRef.current;
+        const cleanFinal = sessionFinal.trim();
+        const fullText = base
+          ? (cleanFinal ? `${base} ${cleanFinal}` : base)
+          : cleanFinal;
+
+        setInputText(fullText);
+        setInterimTranscript(sessionInterim);
+
         if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-        // Keep listening while speaking, allow up to 3.5 seconds of pause between words
+        // Generous thinking pause: 4.5 seconds before auto-closing
         silenceTimerRef.current = setTimeout(() => {
           recognizerRef.current?.stop();
           setIsListening(false);
           setInterimTranscript('');
-        }, 3500);
-      },
-      onFinalResult: (final) => {
-        setInterimTranscript('');
-        if (final && final.trim()) {
-          setInputText((prev) => (prev ? `${prev.trim()} ${final.trim()}` : final.trim()));
-        }
-        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-        // Give 3.5 seconds of thinking/pause time before automatically closing the mic
-        silenceTimerRef.current = setTimeout(() => {
-          recognizerRef.current?.stop();
-          setIsListening(false);
-          setInterimTranscript('');
-        }, 3500);
+        }, 4500);
       },
       onError: (err) => {
         if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);

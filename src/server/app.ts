@@ -21,7 +21,11 @@ app.use((req, res, next) => {
 
 // Helper to get GoogleGenAI client dynamically with latest env vars
 export function getAiClient(): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey =
+    process.env.GEMINI_API_KEY ||
+    process.env.API_KEY ||
+    process.env.GOOGLE_API_KEY ||
+    process.env.VITE_GEMINI_API_KEY;
   if (!apiKey) return null;
   return new GoogleGenAI({
     apiKey: apiKey,
@@ -49,18 +53,28 @@ export function extractJson(text: string): any {
 }
 
 // Voice mapping from persona to Gemini prebuilt voice
+// Standard official Gemini voices are: 'Puck', 'Charon', 'Kore', 'Fenrir', 'Aoede'
+export const VALID_GEMINI_VOICES = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Aoede'] as const;
+
 export const VOICE_MAP: Record<string, string> = {
   kore: 'Kore',
-  zephyra: 'Zephyr',
+  zephyra: 'Aoede',
   alex: 'Fenrir',
   david: 'Charon',
   puck: 'Puck',
   Kore: 'Kore',
-  Zephyr: 'Zephyr',
+  Zephyr: 'Aoede',
+  Zephyra: 'Aoede',
+  Aoede: 'Aoede',
   Fenrir: 'Fenrir',
   Charon: 'Charon',
   Puck: 'Puck',
 };
+
+export function resolveVoice(voiceId?: string, fallback: string = 'Fenrir'): string {
+  const candidate = (voiceId && VOICE_MAP[voiceId.toLowerCase()]) || (voiceId && VOICE_MAP[voiceId]) || fallback;
+  return VALID_GEMINI_VOICES.includes(candidate as any) ? candidate : fallback;
+}
 
 // Router with all API endpoints
 const apiRouter = express.Router();
@@ -382,41 +396,37 @@ Return STRICT JSON matching this schema:
   let audioBase64: string | null = null;
   if (generateAudio && ai && parsedData.replyText) {
     try {
-      const selectedVoice = VOICE_MAP[voiceId] || VOICE_MAP[tutorDisplayName.toLowerCase()] || 'Fenrir';
+      const selectedVoice = resolveVoice(voiceId || tutorDisplayName, 'Fenrir');
+      const ttsCandidateModels = ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts'];
 
-      const ttsPromise = ai.models.generateContent({
-        model: 'gemini-3.8-flash-lite-tts',
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              {
-                text: parsedData.replyText,
-                speechMetadata: {
-                  style: `Bilingual conversational English tutor with ${scenario.accent || 'American'} accent. Fluent, natural English with clear, authentic Brazilian Portuguese pronunciation for Portuguese words and explanations, maintaining natural pauses.`,
+      for (const ttsModel of ttsCandidateModels) {
+        try {
+          const ttsPromise = ai.models.generateContent({
+            model: ttsModel,
+            contents: parsedData.replyText,
+            config: {
+              responseModalities: ['AUDIO'],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName: selectedVoice },
                 },
               },
-            ],
-          },
-        ],
-        config: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: selectedVoice },
             },
-          },
-        },
-      });
+          });
 
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('TTS timeout')), 18000)
-      );
+          const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('TTS timeout')), 15000)
+          );
 
-      const ttsResponse: any = await Promise.race([ttsPromise, timeoutPromise]);
-      const audioData = ttsResponse?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-      if (audioData) {
-        audioBase64 = audioData;
+          const ttsResponse: any = await Promise.race([ttsPromise, timeoutPromise]);
+          const audioData = ttsResponse?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+          if (audioData) {
+            audioBase64 = audioData;
+            break;
+          }
+        } catch (mErr: any) {
+          console.warn(`[Tutor] TTS model ${ttsModel} attempt failed:`, mErr?.message || mErr);
+        }
       }
     } catch (audioErr) {
       console.log('[Tutor] TTS generation error or timeout:', audioErr);
@@ -433,56 +443,72 @@ Return STRICT JSON matching this schema:
 
 // 2. Dedicated Text-to-Speech Endpoint
 apiRouter.post('/tts', async (req, res) => {
-  const ai = getAiClient();
-  if (!ai) {
-    return res.status(500).json({ error: 'GEMINI_API_KEY is not configured on the server.' });
-  }
-
   try {
-    const { text, voiceId = 'alex', voiceName, accent = 'American' } = req.body;
-    if (!text) {
+    const ai = getAiClient();
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
+    const { text, voiceId = 'alex', voiceName } = body;
+
+    if (!text || typeof text !== 'string' || !text.trim()) {
       return res.status(400).json({ error: 'Text is required for TTS.' });
     }
 
-    const selectedVoice = VOICE_MAP[voiceId] || VOICE_MAP[voiceName] || 'Fenrir';
-
-    const ttsResponse = await ai.models.generateContent({
-      model: 'gemini-3.8-flash-lite-tts',
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            {
-              text: text,
-              speechMetadata: {
-                style: `Bilingual conversational English tutor with ${accent} accent. Fluent natural English with clear Brazilian Portuguese pronunciation for phrases and explanations.`,
-              },
-            },
-          ],
-        },
-      ],
-      config: {
-        responseModalities: ['AUDIO'],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: selectedVoice },
-          },
-        },
-      },
-    });
-
-    const audioData = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    if (!audioData) {
-      return res.status(500).json({ error: 'No audio generated by TTS model.' });
+    if (!ai) {
+      console.warn('[TTS] GEMINI_API_KEY is not configured on the server. Returning graceful fallback.');
+      return res.status(200).json({
+        audioBase64: null,
+        fallbackToWebSpeech: true,
+        warning: 'GEMINI_API_KEY not configured on server.',
+      });
     }
 
-    return res.json({
-      audioBase64: audioData,
-      mimeType: 'audio/wav',
+    const selectedVoice = resolveVoice(voiceId || voiceName, 'Fenrir');
+    const ttsCandidateModels = ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts'];
+    let audioData: string | null = null;
+    let lastError: any = null;
+
+    for (const model of ttsCandidateModels) {
+      try {
+        const ttsResponse = await ai.models.generateContent({
+          model,
+          contents: text.trim(),
+          config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: selectedVoice },
+              },
+            },
+          },
+        });
+
+        audioData = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data || null;
+        if (audioData) break;
+      } catch (err: any) {
+        lastError = err;
+        console.warn(`[TTS] Model ${model} failed:`, err?.message || err);
+      }
+    }
+
+    if (audioData) {
+      return res.json({
+        audioBase64: audioData,
+        mimeType: 'audio/wav',
+      });
+    }
+
+    // Gracefully advise client to fallback to WebSpeech rather than crashing with 500
+    return res.status(200).json({
+      audioBase64: null,
+      fallbackToWebSpeech: true,
+      warning: lastError?.message || 'TTS generation unavailable.',
     });
   } catch (error: any) {
-    console.error('Error in /api/tts:', error);
-    return res.status(500).json({ error: error.message || 'TTS generation failed.' });
+    console.error('Error in /api/tts handler:', error);
+    return res.status(200).json({
+      audioBase64: null,
+      fallbackToWebSpeech: true,
+      error: error?.message || 'Internal handler error',
+    });
   }
 });
 
