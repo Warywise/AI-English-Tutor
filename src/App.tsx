@@ -29,6 +29,7 @@ import {
 import {
   isSpeechRecognitionSupported,
   SpeechRecognizer,
+  mergeSpeechSegments,
   audioPlayer,
   unlockMobileAudio,
 } from './utils/speech';
@@ -341,12 +342,19 @@ export default function App() {
       onSessionTranscript: (sessionFinal, sessionInterim) => {
         const base = baseInputTextRef.current;
         const cleanFinal = sessionFinal.trim();
+        const cleanInterim = sessionInterim.trim();
+
+        // While speaking, merge final and interim so user sees what is being recognized without duplicate repeats
+        const currentSession = cleanFinal
+          ? (cleanInterim ? mergeSpeechSegments([cleanFinal, cleanInterim]) : cleanFinal)
+          : cleanInterim;
+
         const fullText = base
-          ? (cleanFinal ? `${base} ${cleanFinal}` : base)
-          : cleanFinal;
+          ? (currentSession ? `${base} ${currentSession}` : base)
+          : currentSession;
 
         setInputText(fullText);
-        setInterimTranscript(sessionInterim);
+        setInterimTranscript(cleanInterim);
 
         if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
         // Generous thinking pause: 4.5 seconds before auto-closing

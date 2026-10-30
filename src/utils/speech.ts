@@ -21,6 +21,80 @@ export interface SpeechRecognitionHandlers {
   onEnd?: () => void;
 }
 
+/**
+ * Intelligently merges speech transcript segments, handling:
+ * 1. Mobile Android Chrome bug where results accumulate full utterance repeatedly
+ *    (e.g., ["let's", "let's talk", "let's talk about", "let's talk about something"])
+ * 2. Standard desktop Chrome behavior where results are disjoint segments
+ *    (e.g., ["let's", "talk", "about", "something"])
+ * 3. Partial phrase overlaps at segment boundaries
+ */
+export function mergeSpeechSegments(segments: string[]): string {
+  let merged = '';
+
+  const clean = (s: string) => s.toLowerCase().replace(/[.,!?;:"'—\-]/g, '').replace(/\s+/g, ' ').trim();
+
+  for (const raw of segments) {
+    const segment = (raw || '').trim();
+    if (!segment) continue;
+
+    if (!merged) {
+      merged = segment;
+      continue;
+    }
+
+    const normMerged = clean(merged);
+    const normSegment = clean(segment);
+
+    if (!normSegment) continue;
+
+    // 1. Android cumulative replacement: new segment starts with or is a continuation of merged
+    if (normSegment.startsWith(normMerged)) {
+      merged = segment;
+      continue;
+    }
+
+    // 2. Redundant duplicate or substring: new segment is already included inside merged
+    if (normMerged.includes(normSegment)) {
+      continue;
+    }
+
+    // 3. Merged is a superset of the segment
+    if (normMerged.startsWith(normSegment)) {
+      continue;
+    }
+
+    // 4. Overlap check by words at boundary
+    const mergedWords = merged.split(/\s+/);
+    const segmentWords = segment.split(/\s+/);
+
+    let maxOverlap = 0;
+    const maxCheck = Math.min(mergedWords.length, segmentWords.length, 6);
+
+    for (let overlap = maxCheck; overlap >= 1; overlap--) {
+      const mergedTail = mergedWords.slice(-overlap).map(clean).join(' ');
+      const segmentHead = segmentWords.slice(0, overlap).map(clean).join(' ');
+
+      if (mergedTail && mergedTail === segmentHead) {
+        maxOverlap = overlap;
+        break;
+      }
+    }
+
+    if (maxOverlap > 0) {
+      const remainingWords = segmentWords.slice(maxOverlap).join(' ');
+      if (remainingWords) {
+        merged = `${merged} ${remainingWords}`;
+      }
+    } else {
+      // Disjoint segment (standard desktop behavior)
+      merged = `${merged} ${segment}`;
+    }
+  }
+
+  return merged.trim();
+}
+
 export class SpeechRecognizer {
   private recognition: any = null;
   private isListening: boolean = false;
@@ -65,23 +139,36 @@ export class SpeechRecognizer {
       };
 
       recognition.onresult = (event: any) => {
-        let fullFinal = '';
-        let currentInterim = '';
+        const finalChunks: string[] = [];
+        const interimChunks: string[] = [];
 
-        // Iterate over all results from 0 to length to ensure pristine deduplication
+        // Collect all chunks emitted by speech recognition engine
         for (let i = 0; i < event.results.length; ++i) {
           const res = event.results[i];
-          if (res && res[0]) {
+          if (res && res[0] && res[0].transcript) {
+            const transcript = res[0].transcript.trim();
+            if (!transcript) continue;
+
             if (res.isFinal) {
-              fullFinal += res[0].transcript + ' ';
+              finalChunks.push(transcript);
             } else {
-              currentInterim += res[0].transcript;
+              interimChunks.push(transcript);
             }
           }
         }
 
-        fullFinal = fullFinal.trim();
-        currentInterim = currentInterim.trim();
+        const fullFinal = mergeSpeechSegments(finalChunks);
+        let currentInterim = mergeSpeechSegments(interimChunks);
+
+        // Deduplicate interim against already-finalized text
+        if (fullFinal && currentInterim) {
+          const combined = mergeSpeechSegments([fullFinal, currentInterim]);
+          if (combined.toLowerCase().startsWith(fullFinal.toLowerCase())) {
+            currentInterim = combined.slice(fullFinal.length).trim();
+          } else if (fullFinal.toLowerCase().includes(currentInterim.toLowerCase())) {
+            currentInterim = '';
+          }
+        }
 
         if (handlers.onSessionTranscript) {
           handlers.onSessionTranscript(fullFinal, currentInterim);
