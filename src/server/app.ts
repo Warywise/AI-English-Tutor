@@ -79,12 +79,26 @@ export function resolveVoice(voiceId?: string, fallback: string = 'Fenrir'): str
 // Router with all API endpoints
 const apiRouter = express.Router();
 
-// Health Check Endpoint
+// Health Check Endpoint with diagnostic info for Vercel
 apiRouter.get('/health', (_req, res) => {
+  const rawKey =
+    process.env.GEMINI_API_KEY ||
+    process.env.API_KEY ||
+    process.env.GOOGLE_API_KEY ||
+    process.env.VITE_GEMINI_API_KEY ||
+    '';
+
+  const keyConfigured = rawKey.trim().length > 0;
+  const keyPrefix = keyConfigured
+    ? `${rawKey.trim().substring(0, 6)}... (length: ${rawKey.trim().length})`
+    : 'none';
+
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    geminiConfigured: !!process.env.GEMINI_API_KEY,
+    geminiConfigured: keyConfigured,
+    keyDetected: keyPrefix,
+    environment: process.env.NODE_ENV || 'production',
   });
 });
 
