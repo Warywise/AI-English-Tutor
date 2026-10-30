@@ -1,6 +1,6 @@
 {
-  "summary":  "Plano de aprimoramento atualizado para incluir a correção do botão 'Parar':\n- Correção do botão Parar/Stop: remoção da condição que fazia o áudio reiniciar em vez de interromper a reprodução imediata.\n- Ajuste de pronúncia bilíngue (Code-Switching) com cadência e pontuação natural.\n- Paridade mobile absoluta: áudio neural idêntico ao desktop e desbloqueio de autoplay no toque do usuário.\n- Remoção definitiva do fallback para voz mecânica do Google Tradutor.",
-  "updatedAt":  "2026-10-29T22:07:40.313418587Z",
+  "summary":  "Plano de correção da transcrição/envio de áudio em WAV 16kHz, remoção total de mensagens de fallback falsas no backend e frontend, e adição de estado de erro real na conversa com opções de Tentar novamente e Editar texto.",
+  "updatedAt":  "2026-10-30T22:15:24.527194447Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

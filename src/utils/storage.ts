@@ -82,7 +82,14 @@ export function saveChatHistory(sessionKey: string, messages: Message[]): void {
   try {
     const raw = localStorage.getItem(STORAGE_KEYS.CHAT_HISTORIES);
     const map = raw ? JSON.parse(raw) : {};
-    map[sessionKey] = messages;
+    // Persist only lightweight text & feedback (omit heavy audioBase64, session-only blob URLs, or retry audio buffers)
+    const lightweightMessages = messages.map(
+      ({ audioBase64, userAudioUrl, retryPayload, ...rest }) => ({
+        ...rest,
+        retryPayload: retryPayload?.text ? { text: retryPayload.text } : undefined,
+      })
+    );
+    map[sessionKey] = lightweightMessages;
     localStorage.setItem(STORAGE_KEYS.CHAT_HISTORIES, JSON.stringify(map));
   } catch (e) {}
 }

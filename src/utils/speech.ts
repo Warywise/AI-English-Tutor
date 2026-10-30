@@ -467,3 +467,411 @@ class GlobalAudioPlayer {
 }
 
 export const audioPlayer = new GlobalAudioPlayer();
+
+export interface RecordedAudioResult {
+  base64: string;
+  mimeType: string;
+  blobUrl: string;
+  durationMs: number;
+}
+
+export function isVoiceRecordingSupported(): boolean {
+  if (typeof window === 'undefined') return false;
+  return !!(
+    navigator.mediaDevices &&
+    typeof navigator.mediaDevices.getUserMedia === 'function' &&
+    typeof window.MediaRecorder !== 'undefined'
+  );
+}
+
+/**
+ * Native MediaRecorder wrapper with WhatsApp-style Pause & Resume support.
+ * While paused, zero bytes of audio are recorded and the timer is frozen.
+ */
+export class VoiceRecorder {
+  private mediaRecorder: MediaRecorder | null = null;
+  private stream: MediaStream | null = null;
+  private chunks: Blob[] = [];
+  private mimeType: string = 'audio/webm';
+  private activeStartTime: number = 0;
+  private accumulatedMs: number = 0;
+
+  private detectSupportedMimeType(): string {
+    if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported) {
+      return '';
+    }
+    const candidates = [
+      'audio/webm;codecs=opus',
+      'audio/webm',
+      'audio/mp4',
+      'audio/ogg;codecs=opus',
+      'audio/aac',
+    ];
+    for (const type of candidates) {
+      if (MediaRecorder.isTypeSupported(type)) {
+        return type;
+      }
+    }
+    return '';
+  }
+
+  public async start(): Promise<void> {
+    this.cancel();
+
+    if (!isVoiceRecordingSupported()) {
+      throw new Error('Gravação de áudio não suportada neste navegador.');
+    }
+
+    try {
+      this.stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+    } catch {
+      // Fallback to basic audio constraints if advanced constraints fail on specific devices
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    }
+
+    const detectedMime = this.detectSupportedMimeType();
+    this.mimeType = detectedMime || 'audio/webm';
+    this.chunks = [];
+    this.accumulatedMs = 0;
+    this.activeStartTime = Date.now();
+
+    let recorder: MediaRecorder;
+    try {
+      const options: MediaRecorderOptions = { audioBitsPerSecond: 32000 };
+      if (detectedMime) options.mimeType = detectedMime;
+      recorder = new MediaRecorder(this.stream, options);
+    } catch {
+      try {
+        recorder = detectedMime
+          ? new MediaRecorder(this.stream, { mimeType: detectedMime })
+          : new MediaRecorder(this.stream);
+      } catch {
+        recorder = new MediaRecorder(this.stream);
+      }
+    }
+
+    this.mediaRecorder = recorder;
+
+    recorder.ondataavailable = (event: BlobEvent) => {
+      if (event.data && event.data.size > 0) {
+        this.chunks.push(event.data);
+      }
+    };
+
+    try {
+      // Collect data chunks every 250ms so pause/stop always has up-to-date buffers
+      recorder.start(250);
+    } catch {
+      recorder.start();
+    }
+  }
+
+  public pause(): boolean {
+    if (this.mediaRecorder && this.mediaRecorder.state === 'recording') {
+      try {
+        try {
+          this.mediaRecorder.requestData();
+        } catch {}
+        this.mediaRecorder.pause();
+        if (this.activeStartTime > 0) {
+          this.accumulatedMs += Date.now() - this.activeStartTime;
+          this.activeStartTime = 0;
+        }
+        return true;
+      } catch (err) {
+        console.warn('Failed to pause MediaRecorder:', err);
+      }
+    }
+    return false;
+  }
+
+  public resume(): boolean {
+    if (this.mediaRecorder && this.mediaRecorder.state === 'paused') {
+      try {
+        this.mediaRecorder.resume();
+        this.activeStartTime = Date.now();
+        return true;
+      } catch (err) {
+        console.warn('Failed to resume MediaRecorder:', err);
+      }
+    }
+    return false;
+  }
+
+  public getState(): 'inactive' | 'recording' | 'paused' {
+    return this.mediaRecorder ? this.mediaRecorder.state : 'inactive';
+  }
+
+  public stop(): Promise<RecordedAudioResult> {
+    return new Promise((resolve, reject) => {
+      const recorder = this.mediaRecorder;
+      if (!recorder || recorder.state === 'inactive') {
+        this.releaseStream();
+        reject(new Error('Nenhuma gravação ativa no momento.'));
+        return;
+      }
+
+      if (recorder.state === 'recording' && this.activeStartTime > 0) {
+        this.accumulatedMs += Date.now() - this.activeStartTime;
+        this.activeStartTime = 0;
+      }
+
+      const finalDurationMs = Math.max(500, this.accumulatedMs);
+      let settled = false;
+
+      const finalizeRecording = async () => {
+        if (settled) return;
+        settled = true;
+        try {
+          const rawMime = recorder.mimeType || this.mimeType || 'audio/webm';
+          const cleanMimeType = rawMime.split(';')[0].trim() || 'audio/webm';
+          const rawBlob = new Blob(this.chunks, { type: cleanMimeType });
+          this.chunks = [];
+          this.mediaRecorder = null;
+          this.releaseStream();
+
+          if (rawBlob.size === 0) {
+            reject(new Error('O áudio gravado está vazio. Verifique a permissão do microfone.'));
+            return;
+          }
+
+          // Convert browser WebM/MP4 chunks into universal 16kHz 16-bit mono WAV for Gemini API
+          let finalBlob = rawBlob;
+          let finalMimeType = cleanMimeType;
+
+          try {
+            const wavResult = await this.convertBlobToWav16k(rawBlob);
+            if (wavResult.peakAmplitude < 0.002) {
+              reject(
+                new Error(
+                  'Nenhum som captado pelo microfone (gravação em silêncio). Verifique se o microfone correto está selecionado.'
+                )
+              );
+              return;
+            }
+            finalBlob = wavResult.wavBlob;
+            finalMimeType = 'audio/wav';
+          } catch (wavErr: any) {
+            // If wavErr is our explicit silence error, rethrow it
+            if (wavErr?.message?.includes('Nenhum som captado')) {
+              reject(wavErr);
+              return;
+            }
+            console.warn('Fallback para container de áudio original:', wavErr);
+          }
+
+          const base64 = await this.blobToBase64(finalBlob);
+          const blobUrl = URL.createObjectURL(finalBlob);
+
+          resolve({
+            base64,
+            mimeType: finalMimeType,
+            blobUrl,
+            durationMs: finalDurationMs,
+          });
+        } catch (err) {
+          this.releaseStream();
+          reject(err);
+        }
+      };
+
+      const safetyTimer = setTimeout(() => {
+        if (!settled && this.chunks.length > 0) {
+          finalizeRecording();
+        } else if (!settled) {
+          settled = true;
+          this.releaseStream();
+          reject(new Error('Tempo limite ao finalizar gravação de áudio.'));
+        }
+      }, 2500);
+
+      recorder.onstop = () => {
+        clearTimeout(safetyTimer);
+        finalizeRecording();
+      };
+
+      recorder.onerror = (err) => {
+        clearTimeout(safetyTimer);
+        if (this.chunks.length > 0) {
+          finalizeRecording();
+        } else if (!settled) {
+          settled = true;
+          this.releaseStream();
+          reject(err);
+        }
+      };
+
+      try {
+        // If paused on mobile browsers, resume briefly and flush data before stopping
+        if (recorder.state === 'paused') {
+          try {
+            recorder.resume();
+          } catch {}
+        }
+        try {
+          recorder.requestData();
+        } catch {}
+        recorder.stop();
+      } catch (err) {
+        clearTimeout(safetyTimer);
+        if (this.chunks.length > 0) {
+          finalizeRecording();
+        } else if (!settled) {
+          settled = true;
+          this.releaseStream();
+          reject(err);
+        }
+      }
+    });
+  }
+
+  /**
+   * Decodes browser MediaRecorder blob (WebM/Opus, MP4/AAC, Ogg) and encodes a clean
+   * 16kHz, 16-bit mono RIFF WAV blob with automatic soft-voice gain normalization.
+   */
+  private async convertBlobToWav16k(
+    blob: Blob
+  ): Promise<{ wavBlob: Blob; peakAmplitude: number }> {
+    const AudioContextClass =
+      window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextClass) {
+      throw new Error('AudioContext não disponível');
+    }
+
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioCtx = new AudioContextClass();
+    try {
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+      const targetSampleRate = 16000;
+      const numChannels = audioBuffer.numberOfChannels;
+      const sourceLength = audioBuffer.length;
+      const sourceRate = audioBuffer.sampleRate;
+
+      // Mix down to mono
+      const monoSource = new Float32Array(sourceLength);
+      for (let ch = 0; ch < numChannels; ch++) {
+        const channelData = audioBuffer.getChannelData(ch);
+        for (let i = 0; i < sourceLength; i++) {
+          monoSource[i] += channelData[i] / numChannels;
+        }
+      }
+
+      // Resample to 16kHz via linear interpolation
+      const targetLength = Math.max(1, Math.round((sourceLength * targetSampleRate) / sourceRate));
+      const resampled = new Float32Array(targetLength);
+      const ratio = sourceLength / targetLength;
+      let peakAmplitude = 0;
+
+      for (let i = 0; i < targetLength; i++) {
+        const srcIdx = i * ratio;
+        const idx0 = Math.floor(srcIdx);
+        const idx1 = Math.min(sourceLength - 1, idx0 + 1);
+        const frac = srcIdx - idx0;
+        const sample = monoSource[idx0] * (1 - frac) + monoSource[idx1] * frac;
+        resampled[i] = sample;
+        const abs = Math.abs(sample);
+        if (abs > peakAmplitude) {
+          peakAmplitude = abs;
+        }
+      }
+
+      // Apply gentle normalization if voice is quiet (so Gemini hears every phoneme clearly)
+      const gain = peakAmplitude > 0.005 && peakAmplitude < 0.7 ? Math.min(3.5, 0.85 / peakAmplitude) : 1.0;
+
+      // Encode 44-byte RIFF WAV header + 16-bit PCM samples
+      const bytesPerSample = 2;
+      const dataByteLength = targetLength * bytesPerSample;
+      const buffer = new ArrayBuffer(44 + dataByteLength);
+      const view = new DataView(buffer);
+
+      const writeAscii = (offset: number, str: string) => {
+        for (let i = 0; i < str.length; i++) {
+          view.setUint8(offset + i, str.charCodeAt(i));
+        }
+      };
+
+      writeAscii(0, 'RIFF');
+      view.setUint32(4, 36 + dataByteLength, true);
+      writeAscii(8, 'WAVE');
+      writeAscii(12, 'fmt ');
+      view.setUint32(16, 16, true); // PCM chunk size
+      view.setUint16(20, 1, true); // PCM format = 1
+      view.setUint16(22, 1, true); // Mono = 1 channel
+      view.setUint32(24, targetSampleRate, true);
+      view.setUint32(28, targetSampleRate * bytesPerSample, true); // Byte rate
+      view.setUint16(32, bytesPerSample, true); // Block align
+      view.setUint16(34, 16, true); // 16 bits per sample
+      writeAscii(36, 'data');
+      view.setUint32(40, dataByteLength, true);
+
+      let offset = 44;
+      for (let i = 0; i < targetLength; i++) {
+        const clamped = Math.max(-1, Math.min(1, resampled[i] * gain));
+        const int16 = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+        view.setInt16(offset, int16, true);
+        offset += 2;
+      }
+
+      return {
+        wavBlob: new Blob([buffer], { type: 'audio/wav' }),
+        peakAmplitude,
+      };
+    } finally {
+      try {
+        await audioCtx.close();
+      } catch {}
+    }
+  }
+
+  public cancel(): void {
+    this.chunks = [];
+    this.accumulatedMs = 0;
+    this.activeStartTime = 0;
+    if (this.mediaRecorder) {
+      const rec = this.mediaRecorder;
+      this.mediaRecorder = null;
+      rec.ondataavailable = null;
+      rec.onstop = null;
+      rec.onerror = null;
+      if (rec.state !== 'inactive') {
+        try {
+          rec.stop();
+        } catch (e) {}
+      }
+    }
+    this.releaseStream();
+  }
+
+  private releaseStream(): void {
+    if (this.stream) {
+      try {
+        this.stream.getTracks().forEach((track) => track.stop());
+      } catch (e) {}
+      this.stream = null;
+    }
+  }
+
+  private blobToBase64(blob: Blob): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const result = reader.result as string;
+        if (!result) {
+          reject(new Error('Falha ao converter áudio em Base64'));
+          return;
+        }
+        const base64 = result.includes(',') ? result.split(',')[1] : result;
+        resolve(base64);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
+}
+

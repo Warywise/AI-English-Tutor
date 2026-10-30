@@ -111,15 +111,35 @@ export interface SuggestedReply {
   tone: string;
 }
 
+export interface MessageSendError {
+  message: string;
+  details?: string;
+  code?: string;
+  stage?: 'transcription' | 'chat';
+}
+
+export interface MessageRetryPayload {
+  text?: string;
+  audioPayload?: {
+    base64: string;
+    mimeType: string;
+    blobUrl: string;
+  };
+}
+
 export interface Message {
   id: string;
   role: 'user' | 'assistant';
   text: string;
   translationPt?: string;
+  isVoiceMessage?: boolean;
+  userAudioUrl?: string;
   audioBase64?: string | null;
   audioMimeType?: string;
   feedback?: TurnFeedback;
   suggestedReplies?: SuggestedReply[];
+  sendError?: MessageSendError;
+  retryPayload?: MessageRetryPayload;
   timestamp: number;
 }
 

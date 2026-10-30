@@ -32,6 +32,8 @@ import {
   mergeSpeechSegments,
   audioPlayer,
   unlockMobileAudio,
+  VoiceRecorder,
+  isVoiceRecordingSupported,
 } from './utils/speech';
 import {
   loadSettings,
@@ -65,6 +67,12 @@ import {
   Lightbulb,
   Brain,
   X,
+  Pause,
+  Play,
+  Trash2,
+  Pencil,
+  AlertTriangle,
+  RotateCcw,
 } from 'lucide-react';
 
 const getFreeTutorStarter = (tutorName: string, topic?: string): Message => ({
@@ -126,11 +134,17 @@ export default function App() {
   // Messages per active context
   const [messages, setMessages] = useState<Message[]>([]);
 
-  // Input & Speech
+  // Input & Speech / Voice Recording
   const [inputText, setInputText] = useState('');
   const [isListening, setIsListening] = useState(false);
   const [interimTranscript, setInterimTranscript] = useState('');
   const [isLoadingReply, setIsLoadingReply] = useState(false);
+  const [isRecordingAudio, setIsRecordingAudio] = useState(false);
+  const [isRecordingPaused, setIsRecordingPaused] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const [isTranscribingAudio, setIsTranscribingAudio] = useState(false);
+  const [playingUserAudioId, setPlayingUserAudioId] = useState<string | null>(null);
+  const [inputBarNotice, setInputBarNotice] = useState<{ title: string; details?: string } | null>(null);
 
   // Audio Playback state
   const [currentlyPlayingId, setCurrentlyPlayingId] = useState<string | null>(null);
@@ -152,7 +166,11 @@ export default function App() {
 
   // Refs
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const textInputRef = useRef<HTMLInputElement>(null);
   const recognizerRef = useRef<SpeechRecognizer | null>(null);
+  const voiceRecorderRef = useRef<VoiceRecorder>(new VoiceRecorder());
+  const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const userAudioElementRef = useRef<HTMLAudioElement | null>(null);
   const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
   const baseInputTextRef = useRef<string>('');
 
@@ -378,10 +396,223 @@ export default function App() {
     });
   };
 
+  // Format seconds as M:SS (e.g. 0:05)
+  const formatRecordingTime = (totalSeconds: number) => {
+    const mins = Math.floor(totalSeconds / 60);
+    const secs = totalSeconds % 60;
+    return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+  };
+
+  // Start active timer for voice recording
+  const startRecordingTimer = () => {
+    if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
+    recordingTimerRef.current = setInterval(() => {
+      setRecordingSeconds((prev) => prev + 1);
+    }, 1000);
+  };
+
+  const stopRecordingTimer = () => {
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+  };
+
+  // Start WhatsApp-style Voice Recording (with fallback to SpeechRecognition if MediaRecorder is unavailable)
+  const handleStartVoiceRecording = async () => {
+    unlockMobileAudio();
+    handleStopAudio();
+
+    if (isListening) {
+      recognizerRef.current?.stop();
+      setIsListening(false);
+      setInterimTranscript('');
+    }
+
+    if (!isVoiceRecordingSupported()) {
+      toggleListening();
+      return;
+    }
+
+    try {
+      setInputBarNotice(null);
+      await voiceRecorderRef.current.start();
+      setIsRecordingAudio(true);
+      setIsRecordingPaused(false);
+      setRecordingSeconds(0);
+      startRecordingTimer();
+    } catch (err: any) {
+      console.warn('Microphone access error:', err);
+      setInputBarNotice({
+        title: 'Não foi possível acessar o microfone',
+        details: err?.message || 'Verifique se o navegador possui permissão de uso do microfone.',
+      });
+    }
+  };
+
+  // Toggle Pause / Resume during voice recording (zero bytes recorded while paused)
+  const handleTogglePauseRecording = () => {
+    if (!isRecordingAudio) return;
+
+    if (isRecordingPaused) {
+      const resumed = voiceRecorderRef.current.resume();
+      if (resumed) {
+        setIsRecordingPaused(false);
+        startRecordingTimer();
+      }
+    } else {
+      const paused = voiceRecorderRef.current.pause();
+      if (paused) {
+        setIsRecordingPaused(true);
+        stopRecordingTimer();
+      }
+    }
+  };
+
+  // Cancel and discard current voice recording
+  const handleCancelVoiceRecording = () => {
+    stopRecordingTimer();
+    voiceRecorderRef.current.cancel();
+    setIsRecordingAudio(false);
+    setIsRecordingPaused(false);
+    setRecordingSeconds(0);
+  };
+
+  // Transcribe recorded audio into the text input box so the user can review/edit before sending
+  const handleTranscribeToInput = async () => {
+    if (!isRecordingAudio || isTranscribingAudio) return;
+    stopRecordingTimer();
+    setIsTranscribingAudio(true);
+    setInputBarNotice(null);
+
+    try {
+      const audioResult = await voiceRecorderRef.current.stop();
+      setIsRecordingAudio(false);
+      setIsRecordingPaused(false);
+      setRecordingSeconds(0);
+
+      const recentContext = messages
+        .filter((m) => !m.sendError)
+        .slice(-4)
+        .map((m) => m.text)
+        .join(' | ');
+      const profileHint = [
+        learnerProfile.occupation,
+        learnerProfile.interests,
+        learnerProfile.primaryGoal,
+      ]
+        .filter(Boolean)
+        .join(', ');
+
+      const res = await fetch('/api/transcribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          audioBase64: audioResult.base64,
+          mimeType: audioResult.mimeType,
+          contextHint: `${profileHint} — ${recentContext}`,
+        }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.transcription) {
+        setInputText((prev) =>
+          prev.trim() ? `${prev.trim()} ${data.transcription.trim()}` : data.transcription.trim()
+        );
+        setTimeout(() => textInputRef.current?.focus(), 50);
+      } else {
+        setInputBarNotice({
+          title: data.error || 'Não foi possível transcrever o áudio automaticamente',
+          details: data.details || 'Você pode digitar sua frase diretamente no campo abaixo.',
+        });
+        setTimeout(() => textInputRef.current?.focus(), 50);
+      }
+    } catch (err: any) {
+      console.warn('Failed to transcribe audio to input:', err);
+      setIsRecordingAudio(false);
+      setIsRecordingPaused(false);
+      setRecordingSeconds(0);
+      setInputBarNotice({
+        title: 'Falha ao processar gravação de áudio',
+        details: err?.message || 'Tente gravar novamente ou digite sua mensagem abaixo.',
+      });
+    } finally {
+      setIsTranscribingAudio(false);
+    }
+  };
+
+  // Finish recording (even from paused state) and send directly to /api/chat in 1 single call
+  const handleSendVoiceRecording = async () => {
+    if (!isRecordingAudio || isLoadingReply) return;
+    stopRecordingTimer();
+    setInputBarNotice(null);
+
+    try {
+      const audioResult = await voiceRecorderRef.current.stop();
+      setIsRecordingAudio(false);
+      setIsRecordingPaused(false);
+      setRecordingSeconds(0);
+
+      await handleSendMessage(undefined, {
+        base64: audioResult.base64,
+        mimeType: audioResult.mimeType,
+        blobUrl: audioResult.blobUrl,
+      });
+    } catch (err: any) {
+      console.warn('Error stopping voice recorder:', err);
+      setIsRecordingAudio(false);
+      setIsRecordingPaused(false);
+      setRecordingSeconds(0);
+      setInputBarNotice({
+        title: 'Áudio não enviado',
+        details: err?.message || 'Não foi possível capturar o áudio do microfone. Tente gravar novamente.',
+      });
+    }
+  };
+
+  // Play or stop the user's own recorded voice from the current session
+  const handleTogglePlayUserAudio = (messageId: string, blobUrl?: string) => {
+    if (!blobUrl) return;
+    unlockMobileAudio();
+
+    if (playingUserAudioId === messageId && userAudioElementRef.current) {
+      userAudioElementRef.current.pause();
+      userAudioElementRef.current.currentTime = 0;
+      setPlayingUserAudioId(null);
+      return;
+    }
+
+    handleStopAudio();
+    if (userAudioElementRef.current) {
+      userAudioElementRef.current.pause();
+    }
+
+    const audio = new Audio(blobUrl);
+    userAudioElementRef.current = audio;
+    setPlayingUserAudioId(messageId);
+
+    audio.onended = () => {
+      setPlayingUserAudioId(null);
+    };
+    audio.onerror = () => {
+      setPlayingUserAudioId(null);
+    };
+    audio.play().catch(() => {
+      setPlayingUserAudioId(null);
+    });
+  };
+
   // Stop current audio cleanly
   const handleStopAudio = () => {
     audioPlayer.stop();
     setCurrentlyPlayingId(null);
+    if (userAudioElementRef.current) {
+      try {
+        userAudioElementRef.current.pause();
+        userAudioElementRef.current.currentTime = 0;
+      } catch (e) {}
+      setPlayingUserAudioId(null);
+    }
   };
 
   // Audio Playback
@@ -399,7 +630,7 @@ export default function App() {
       return;
     }
 
-    audioPlayer.stop();
+    handleStopAudio();
     setCurrentlyPlayingId(id);
     const speed = customSpeed || playbackSpeed;
 
@@ -415,11 +646,17 @@ export default function App() {
     });
   };
 
-  // Send message to IAlex server API
-  const handleSendMessage = async (textToSend?: string) => {
+  // Send message (text OR direct multimodal voice audio) to server API, with full retry support and zero fake fallbacks
+  const handleSendMessage = async (
+    textToSend?: string,
+    audioPayload?: { base64: string; mimeType: string; blobUrl: string },
+    retryMessageId?: string
+  ) => {
     unlockMobileAudio();
-    const text = (textToSend || inputText).trim();
-    if (!text || isLoadingReply) return;
+    setInputBarNotice(null);
+    const isAudioSend = !!audioPayload?.base64;
+    const text = (textToSend !== undefined ? textToSend : inputText).trim();
+    if ((!text && !isAudioSend) || isLoadingReply) return;
 
     if (silenceTimerRef.current) {
       clearTimeout(silenceTimerRef.current);
@@ -432,25 +669,51 @@ export default function App() {
       setInterimTranscript('');
     }
 
-    const userMsg: Message = {
-      id: `user-${Date.now()}`,
-      role: 'user',
-      text,
-      timestamp: Date.now(),
-    };
+    const targetMsgId = retryMessageId || `user-${Date.now()}`;
 
-    const newHistory = [...messages, userMsg];
-    setMessages(newHistory);
-    setInputText('');
+    // Build clean conversation history excluding any unresolved failed messages
+    const existingIdx = retryMessageId ? messages.findIndex((m) => m.id === retryMessageId) : -1;
+    const historySlice = existingIdx >= 0 ? messages.slice(0, existingIdx) : messages;
+    const previousHistory = historySlice.filter((m) => !m.sendError);
+
+    if (retryMessageId) {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === retryMessageId
+            ? {
+                ...m,
+                text: isAudioSend && !text ? '🎙️ Transcrevendo e analisando seu áudio...' : text || m.text,
+                sendError: undefined,
+              }
+            : m
+        )
+      );
+    } else {
+      const userMsg: Message = {
+        id: targetMsgId,
+        role: 'user',
+        text: isAudioSend ? '🎙️ Transcrevendo e analisando seu áudio...' : text,
+        isVoiceMessage: isAudioSend,
+        userAudioUrl: audioPayload?.blobUrl,
+        retryPayload: {
+          text: isAudioSend ? undefined : text,
+          audioPayload,
+        },
+        timestamp: Date.now(),
+      };
+      setMessages((prev) => [...prev, userMsg]);
+      if (!isAudioSend) {
+        setInputText('');
+      }
+      incrementMessageStats();
+    }
+
     setInterimTranscript('');
     setIsLoadingReply(true);
 
-    // Update message stats
-    incrementMessageStats();
-
-    // AbortController with 22-second timeout to allow rich contextual memory formulation
+    // AbortController with 25-second timeout to allow multimodal audio + contextual memory processing
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 22000);
+    const timeoutId = setTimeout(() => controller.abort(), 25000);
 
     try {
       const res = await fetch('/api/chat', {
@@ -459,8 +722,10 @@ export default function App() {
         signal: controller.signal,
         body: JSON.stringify({
           mode,
-          messages: newHistory.map((m) => ({ role: m.role, text: m.text })),
+          messages: previousHistory.map((m) => ({ role: m.role, text: m.text })),
           userMessage: text,
+          userAudioBase64: audioPayload?.base64 || '',
+          userAudioMimeType: audioPayload?.mimeType || '',
           scenario: activeScenario,
           level,
           voiceId,
@@ -482,11 +747,23 @@ export default function App() {
 
       clearTimeout(timeoutId);
 
+      const data = await res.json().catch(() => ({}));
+
       if (!res.ok) {
-        throw new Error('Falha na resposta da IA');
+        const apiErr: any = new Error(data.error || 'Falha ao obter resposta da IA');
+        apiErr.errorTitle = data.error || 'Falha ao enviar mensagem';
+        apiErr.errorDetails =
+          data.details || 'Ocorreu uma instabilidade na comunicação com a IA. Tente novamente.';
+        apiErr.errorCode = data.code;
+        apiErr.errorStage = data.stage || (isAudioSend && !text ? 'transcription' : 'chat');
+        apiErr.userTranscription = data.userTranscription || '';
+        throw apiErr;
       }
 
-      const data = await res.json();
+      const resolvedUserText =
+        isAudioSend && data.userTranscription
+          ? data.userTranscription.trim()
+          : text;
 
       const assistantMsg: Message = {
         id: `assistant-${Date.now()}`,
@@ -500,7 +777,21 @@ export default function App() {
         timestamp: Date.now(),
       };
 
-      setMessages((prev) => [...prev, assistantMsg]);
+      // Update user bubble with the accurate AI transcription (clearing sendError and retryPayload) and append tutor reply
+      setMessages((prev) =>
+        prev
+          .map((m) =>
+            m.id === targetMsgId
+              ? {
+                  ...m,
+                  text: resolvedUserText || m.text,
+                  sendError: undefined,
+                  retryPayload: undefined,
+                }
+              : m
+          )
+          .concat(assistantMsg)
+      );
 
       // Automatically register any new facts learned about the user
       if (
@@ -547,28 +838,126 @@ export default function App() {
       clearTimeout(timeoutId);
       console.warn('Chat error or timeout:', err);
 
-      // Graceful tutor fallback message
-      const errorMsg: Message = {
-        id: `err-${Date.now()}`,
-        role: 'assistant',
-        text: "I heard you! That's a great point. Como você expandiria essa ideia em mais uma frase? Tell me more about it!",
-        translationPt: "Eu te ouvi! Ótimo ponto. Como você expandiria essa ideia em mais uma frase? Me conte mais sobre isso!",
-        timestamp: Date.now(),
-        feedback: {
-          grammarScore: 88,
-          fluencyScore: 85,
-          vocabularyScore: 85,
-          overallFeedbackPt: "Muito bom! Para continuar fluindo, tente adicionar mais um detalhe sobre o assunto.",
-          corrections: [],
-          betterWaysToSay: [],
-          pronunciationTips: [],
-          vocabularyBoost: [],
-        },
-      };
-      setMessages((prev) => [...prev, errorMsg]);
+      const isTimeout = err?.name === 'AbortError';
+      const partialTranscript = (err?.userTranscription || '').trim();
+      const preservedText = partialTranscript || (!isAudioSend ? text : '');
+
+      const errorTitle = isTimeout
+        ? 'Tempo limite de resposta excedido'
+        : err?.errorTitle || err?.message || 'Falha ao enviar mensagem';
+
+      const errorDetails = isTimeout
+        ? 'O servidor demorou além do esperado para responder. Você pode tentar novamente sem perder sua mensagem.'
+        : err?.errorDetails ||
+          (isAudioSend
+            ? 'Não foi possível transcrever ou processar o áudio enviado. Tente novamente ou edite como texto.'
+            : 'Houve uma falha ao comunicar com o tutor de IA. Clique em Tentar novamente.');
+
+      // Mark the user's message bubble with the explicit error and preserve retryPayload (NO fake tutor reply!)
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === targetMsgId
+            ? {
+                ...m,
+                text:
+                  preservedText ||
+                  (isAudioSend ? '🎙️ Áudio gravado (envio não concluído)' : m.text),
+                sendError: {
+                  message: errorTitle,
+                  details: errorDetails,
+                  code: err?.errorCode,
+                  stage: err?.errorStage || (isAudioSend && !preservedText ? 'transcription' : 'chat'),
+                },
+                retryPayload: {
+                  text: preservedText || undefined,
+                  audioPayload: audioPayload || m.retryPayload?.audioPayload,
+                },
+              }
+            : m
+        )
+      );
     } finally {
       setIsLoadingReply(false);
     }
+  };
+
+  // Retry sending a failed user message in place
+  const handleRetryMessage = (message: Message) => {
+    if (isLoadingReply) return;
+    const retryText =
+      message.retryPayload?.text ||
+      (!message.isVoiceMessage && message.text ? message.text : undefined);
+    const retryAudio = message.retryPayload?.audioPayload;
+    handleSendMessage(retryText, retryAudio, message.id);
+  };
+
+  // Move a failed message to the text input box so the user can edit or type manually
+  const handleEditFailedMessage = async (message: Message) => {
+    if (isLoadingReply || isTranscribingAudio) return;
+
+    const existingText =
+      message.retryPayload?.text ||
+      (!message.isVoiceMessage && message.text ? message.text : '');
+
+    if (existingText) {
+      setInputText(existingText);
+      setMessages((prev) => prev.filter((m) => m.id !== message.id));
+      setInputBarNotice(null);
+      setTimeout(() => textInputRef.current?.focus(), 50);
+      return;
+    }
+
+    const audioPayload = message.retryPayload?.audioPayload;
+    if (audioPayload?.base64) {
+      setIsTranscribingAudio(true);
+      try {
+        const recentContext = messages
+          .filter((m) => !m.sendError && m.id !== message.id)
+          .slice(-4)
+          .map((m) => m.text)
+          .join(' | ');
+        const profileHint = [
+          learnerProfile.occupation,
+          learnerProfile.interests,
+          learnerProfile.primaryGoal,
+        ]
+          .filter(Boolean)
+          .join(', ');
+
+        const res = await fetch('/api/transcribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            audioBase64: audioPayload.base64,
+            mimeType: audioPayload.mimeType,
+            contextHint: `${profileHint} — ${recentContext}`,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.transcription) {
+          setInputText(data.transcription.trim());
+          setMessages((prev) => prev.filter((m) => m.id !== message.id));
+          setInputBarNotice(null);
+          setTimeout(() => textInputRef.current?.focus(), 50);
+          return;
+        }
+      } catch {} finally {
+        setIsTranscribingAudio(false);
+      }
+    }
+
+    // If audio was inaudible/empty and could not be transcribed, remove the failed bubble and focus input
+    setMessages((prev) => prev.filter((m) => m.id !== message.id));
+    setInputBarNotice({
+      title: 'Digite ou ajuste sua mensagem abaixo',
+      details: 'A transcrição automática não detectou fala clara neste áudio. Digite o que desejava dizer para enviar.',
+    });
+    setTimeout(() => textInputRef.current?.focus(), 50);
+  };
+
+  // Delete a failed message bubble
+  const handleDeleteFailedMessage = (messageId: string) => {
+    setMessages((prev) => prev.filter((m) => m.id !== messageId));
   };
 
   // Reset current session
@@ -755,9 +1144,16 @@ export default function App() {
 
             {/* Message Stream */}
             <div className="flex-1 space-y-5 overflow-y-auto pb-4">
-              {messages.map((message) => {
+              {messages.map((message, msgIdx) => {
                 const isAssistant = message.role === 'assistant';
                 const isPlayingThis = currentlyPlayingId === message.id;
+                const isPlayingMyVoice = playingUserAudioId === message.id;
+                const precedingUserMessage = isAssistant
+                  ? messages
+                      .slice(0, msgIdx)
+                      .reverse()
+                      .find((m) => m.role === 'user')?.text || ''
+                  : message.text;
 
                 return (
                   <div
@@ -773,6 +1169,11 @@ export default function App() {
                             : `${activeScenario.partnerRole.split(',')[0]} (${tutorName})`
                           : 'Você (Learner)'}
                       </span>
+                      {!isAssistant && message.isVoiceMessage && (
+                        <span className="text-[11px] text-slate-400">
+                          · Áudio transcrito com IA
+                        </span>
+                      )}
                       {isPlayingThis && (
                         <span className="flex items-center gap-1 text-[10px] font-semibold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full">
                           <Volume2 className="w-3 h-3 animate-pulse" />
@@ -786,6 +1187,8 @@ export default function App() {
                       className={`max-w-[92%] sm:max-w-[85%] rounded-3xl p-4 shadow-sm transition-all ${
                         isAssistant
                           ? 'bg-white border border-slate-200/90 text-slate-900 rounded-tl-sm'
+                          : message.sendError
+                          ? 'bg-rose-950 text-white border-2 border-rose-400/80 rounded-tr-sm shadow-rose-100'
                           : 'bg-indigo-600 text-white rounded-tr-sm shadow-indigo-100'
                       }`}
                     >
@@ -793,6 +1196,100 @@ export default function App() {
                       <p className="text-sm md:text-base leading-relaxed font-normal whitespace-pre-wrap">
                         {message.text}
                       </p>
+
+                      {/* Session-only User Voice Replay Bar (if recorded in current session) */}
+                      {!isAssistant && message.userAudioUrl && (
+                        <div
+                          className={`mt-2.5 pt-2 border-t flex items-center justify-between gap-3 ${
+                            message.sendError ? 'border-rose-800/70' : 'border-indigo-500/40'
+                          }`}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => handleTogglePlayUserAudio(message.id, message.userAudioUrl)}
+                            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-xl text-xs font-medium transition-colors ${
+                              message.sendError
+                                ? 'bg-rose-900/90 hover:bg-rose-800 text-rose-100'
+                                : 'bg-indigo-700/70 hover:bg-indigo-700 text-indigo-50'
+                            }`}
+                          >
+                            {isPlayingMyVoice ? (
+                              <>
+                                <Pause className="w-3.5 h-3.5" />
+                                <span>Parar gravação</span>
+                              </>
+                            ) : (
+                              <>
+                                <Play className="w-3.5 h-3.5" />
+                                <span>Ouvir minha gravação</span>
+                              </>
+                            )}
+                          </button>
+                          <span
+                            className={`text-[10px] ${
+                              message.sendError ? 'text-rose-200' : 'text-indigo-200'
+                            }`}
+                          >
+                            {message.sendError ? 'Áudio preservado para reenvio' : 'Salvo como texto leve'}
+                          </span>
+                        </div>
+                      )}
+
+                      {/* Inline Error & Retry Actions (when sending or transcription fails) */}
+                      {!isAssistant && message.sendError && (
+                        <div className="mt-3 pt-3 border-t border-rose-800/80 space-y-2.5">
+                          <div className="flex items-start gap-2 bg-rose-900/60 border border-rose-700/60 rounded-2xl p-2.5">
+                            <AlertTriangle className="w-4 h-4 text-amber-300 shrink-0 mt-0.5" />
+                            <div className="text-xs leading-relaxed">
+                              <p className="font-semibold text-rose-100">
+                                {message.sendError.message}
+                              </p>
+                              {message.sendError.details && (
+                                <p className="text-rose-200/90 mt-0.5">
+                                  {message.sendError.details}
+                                </p>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => handleRetryMessage(message)}
+                              disabled={isLoadingReply || isTranscribingAudio}
+                              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white hover:bg-rose-50 text-rose-950 font-semibold text-xs shadow-xs transition-all disabled:opacity-50"
+                            >
+                              <RotateCcw className="w-3.5 h-3.5" />
+                              <span>Tentar novamente</span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => handleEditFailedMessage(message)}
+                              disabled={isLoadingReply || isTranscribingAudio}
+                              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-rose-800/80 hover:bg-rose-800 text-rose-50 font-medium text-xs transition-all disabled:opacity-50"
+                            >
+                              {isTranscribingAudio ? (
+                                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                              ) : (
+                                <Pencil className="w-3.5 h-3.5" />
+                              )}
+                              <span>Editar texto</span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteFailedMessage(message.id)}
+                              disabled={isLoadingReply}
+                              className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl hover:bg-rose-900/80 text-rose-200 hover:text-white text-xs transition-all ml-auto"
+                              title="Descartar esta mensagem"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                              <span>Excluir</span>
+                            </button>
+                          </div>
+                        </div>
+                      )}
 
                       {/* Subtitle Translation in Portuguese */}
                       {showTranslations && message.translationPt && (
@@ -882,7 +1379,7 @@ export default function App() {
                       <div className="w-full max-w-[92%] sm:max-w-[85%]">
                         <FeedbackCard
                           feedback={message.feedback}
-                          userText={messages.find((m) => m.role === 'user')?.text || ''}
+                          userText={precedingUserMessage}
                           isConciseMode={mode === 'free_tutor'}
                           onCheckPronunciation={(phrase) => setPronunciationPhrase(phrase)}
                           onPlayWord={(word) => audioPlayer.play(word, null, { rate: 0.9, accent })}
@@ -934,7 +1431,7 @@ export default function App() {
                   <div className="p-3.5 rounded-2xl bg-white border border-slate-200 shadow-sm flex items-center gap-3">
                     <Loader2 className="w-4 h-4 animate-spin text-indigo-600" />
                     <span className="text-xs font-medium text-slate-600">
-                      {tutorName} está formulando a resposta...
+                      {tutorName} está ouvindo e preparando a resposta...
                     </span>
                   </div>
                 </div>
@@ -945,7 +1442,30 @@ export default function App() {
 
             {/* Input Bar Section */}
             <div className="pt-2 sticky bottom-0 bg-slate-100/95 backdrop-blur-sm">
-              {/* Audio Wave Indicator when listening */}
+              {/* Inline Notice Banner (for silent mic or manual text edit prompt) */}
+              {inputBarNotice && (
+                <div className="mb-2 px-3.5 py-2.5 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 flex items-start justify-between gap-3 shadow-xs animate-in fade-in duration-200">
+                  <div className="flex items-start gap-2 text-xs">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                    <div>
+                      <p className="font-semibold">{inputBarNotice.title}</p>
+                      {inputBarNotice.details && (
+                        <p className="text-amber-800/90 mt-0.5">{inputBarNotice.details}</p>
+                      )}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setInputBarNotice(null)}
+                    className="p-1 rounded-lg hover:bg-amber-100 text-amber-700 transition-colors shrink-0"
+                    title="Fechar aviso"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
+
+              {/* Audio Wave Indicator when legacy SpeechRecognition is active */}
               {isListening && (
                 <div className="mb-2 flex justify-center">
                   <AudioWave
@@ -960,65 +1480,163 @@ export default function App() {
               )}
 
               <div className="p-2 sm:p-3 rounded-3xl bg-white border border-slate-200 shadow-xl shadow-slate-200/50">
-                <div className="flex items-center gap-2">
-                  {/* Mic Record Button */}
-                  <button
-                    type="button"
-                    onClick={toggleListening}
-                    className={`p-3 rounded-2xl transition-all shadow-sm flex items-center justify-center shrink-0 ${
-                      isListening
-                        ? 'bg-rose-500 hover:bg-rose-600 text-white animate-pulse ring-4 ring-rose-200'
-                        : 'bg-indigo-50 hover:bg-indigo-100 text-indigo-700'
-                    }`}
-                    title={
-                      isListening
-                        ? 'Clique para parar de gravar'
-                        : 'Clique e fale em inglês no microfone'
-                    }
-                  >
-                    {isListening ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
-                  </button>
+                {isRecordingAudio ? (
+                  /* WhatsApp-style Voice Recording Bar with Pause / Resume / Edit / Send */
+                  <div className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-2 py-0.5">
+                    {/* Cancel / Trash Button */}
+                    <button
+                      type="button"
+                      onClick={handleCancelVoiceRecording}
+                      className="p-2.5 rounded-2xl bg-slate-100 hover:bg-rose-50 text-slate-600 hover:text-rose-600 transition-colors shrink-0 flex items-center gap-1.5 text-xs font-semibold"
+                      title="Cancelar e descartar gravação"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                      <span className="hidden sm:inline">Cancelar</span>
+                    </button>
 
-                  {/* Text Input */}
-                  <input
-                    type="text"
-                    placeholder={
-                      isListening
-                        ? 'Ouvindo sua fala em inglês...'
-                        : mode === 'free_tutor'
-                        ? `Fale no microfone ou envie qualquer mensagem para ${tutorName}...`
-                        : 'Fale ou digite sua resposta para continuar o cenário...'
-                    }
-                    value={inputText}
-                    onChange={(e) => setInputText(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && !e.shiftKey) {
-                        e.preventDefault();
-                        handleSendMessage();
+                    {/* Recording Status + Animated Bars + Active Timer */}
+                    <div className="flex items-center gap-2.5 px-3 py-1.5 rounded-2xl bg-slate-50 border border-slate-200/80 flex-1 min-w-[140px] justify-center">
+                      {isRecordingPaused ? (
+                        <span className="text-xs font-semibold text-amber-700">
+                          Pausado (pensando...)
+                        </span>
+                      ) : (
+                        <div className="flex items-center gap-1 h-4" aria-hidden="true">
+                          <span className="w-1 h-2.5 bg-rose-500 rounded-full animate-pulse" />
+                          <span className="w-1 h-4 bg-rose-500 rounded-full animate-pulse [animation-delay:150ms]" />
+                          <span className="w-1 h-2 bg-rose-500 rounded-full animate-pulse [animation-delay:300ms]" />
+                          <span className="w-1 h-3.5 bg-rose-500 rounded-full animate-pulse [animation-delay:75ms]" />
+                        </div>
+                      )}
+                      <span className="text-sm font-mono font-bold tabular-nums text-slate-800">
+                        {formatRecordingTime(recordingSeconds)}
+                      </span>
+                    </div>
+
+                    {/* Pause / Resume Button (WhatsApp style) */}
+                    <button
+                      type="button"
+                      onClick={handleTogglePauseRecording}
+                      className={`px-3 py-2.5 rounded-2xl text-xs font-semibold transition-all shrink-0 flex items-center gap-1.5 ${
+                        isRecordingPaused
+                          ? 'bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200'
+                          : 'bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200'
+                      }`}
+                      title={
+                        isRecordingPaused
+                          ? 'Continuar gravando do mesmo ponto'
+                          : 'Pausar gravação para pensar na próxima palavra (não grava silêncio)'
                       }
-                    }}
-                    disabled={isLoadingReply}
-                    className="flex-1 bg-transparent px-2 py-1.5 text-sm md:text-base text-slate-900 placeholder:text-slate-400 focus:outline-none"
-                  />
+                    >
+                      {isRecordingPaused ? (
+                        <>
+                          <Play className="w-4 h-4" />
+                          <span>Continuar</span>
+                        </>
+                      ) : (
+                        <>
+                          <Pause className="w-4 h-4" />
+                          <span>Pausar</span>
+                        </>
+                      )}
+                    </button>
 
-                  {/* Send Button */}
-                  <button
-                    type="button"
-                    onClick={() => handleSendMessage()}
-                    disabled={!inputText.trim() || isLoadingReply}
-                    className="p-3 rounded-2xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white shadow-md shadow-indigo-200 transition-all shrink-0 flex items-center justify-center"
-                    title="Enviar mensagem"
-                  >
-                    <Send className="w-4 h-4" />
-                  </button>
-                </div>
+                    {/* Secondary Option: Transcribe to Input Box to Edit Before Sending */}
+                    <button
+                      type="button"
+                      onClick={handleTranscribeToInput}
+                      disabled={isTranscribingAudio}
+                      className="px-3 py-2.5 rounded-2xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold transition-all shrink-0 flex items-center gap-1.5"
+                      title="Converter áudio em texto na caixa de digitação para revisar antes de enviar"
+                    >
+                      {isTranscribingAudio ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Pencil className="w-3.5 h-3.5" />
+                      )}
+                      <span className="hidden md:inline">Editar texto</span>
+                    </button>
+
+                    {/* Primary Action: Send Audio Directly */}
+                    <button
+                      type="button"
+                      onClick={handleSendVoiceRecording}
+                      disabled={isLoadingReply || isTranscribingAudio}
+                      className="px-4 py-2.5 rounded-2xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white text-xs font-semibold shadow-md shadow-indigo-200 transition-all shrink-0 flex items-center gap-1.5"
+                      title="Enviar áudio direto para o tutor (transcreve com IA + avalia pronúncia real)"
+                    >
+                      <span>Enviar Áudio</span>
+                      <Send className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ) : (
+                  /* Standard Input Bar: Record Voice Button + Text Input + Send Button */
+                  <div className="flex items-center gap-2">
+                    {/* Mic Record Audio Button */}
+                    <button
+                      type="button"
+                      onClick={handleStartVoiceRecording}
+                      disabled={isLoadingReply || isTranscribingAudio}
+                      className={`p-3 rounded-2xl transition-all shadow-sm flex items-center justify-center shrink-0 ${
+                        isListening
+                          ? 'bg-rose-500 hover:bg-rose-600 text-white animate-pulse ring-4 ring-rose-200'
+                          : 'bg-indigo-50 hover:bg-indigo-100 text-indigo-700'
+                      }`}
+                      title="Gravar mensagem de áudio (com opção de pausar e avaliação real de pronúncia)"
+                    >
+                      {isTranscribingAudio ? (
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                      ) : isListening ? (
+                        <MicOff className="w-5 h-5" />
+                      ) : (
+                        <Mic className="w-5 h-5" />
+                      )}
+                    </button>
+
+                    {/* Text Input */}
+                    <input
+                      ref={textInputRef}
+                      type="text"
+                      placeholder={
+                        isTranscribingAudio
+                          ? 'Transcrevendo seu áudio com IA...'
+                          : mode === 'free_tutor'
+                          ? `Clique no 🎙️ para gravar áudio ou digite para ${tutorName}...`
+                          : 'Clique no 🎙️ para gravar áudio ou digite sua resposta...'
+                      }
+                      value={inputText}
+                      onChange={(e) => setInputText(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && !e.shiftKey) {
+                          e.preventDefault();
+                          handleSendMessage();
+                        }
+                      }}
+                      disabled={isLoadingReply || isTranscribingAudio}
+                      className="flex-1 bg-transparent px-2 py-1.5 text-sm md:text-base text-slate-900 placeholder:text-slate-400 focus:outline-none"
+                    />
+
+                    {/* Send Button */}
+                    <button
+                      type="button"
+                      onClick={() => handleSendMessage()}
+                      disabled={!inputText.trim() || isLoadingReply || isTranscribingAudio}
+                      className="p-3 rounded-2xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white shadow-md shadow-indigo-200 transition-all shrink-0 flex items-center justify-center"
+                      title="Enviar mensagem de texto"
+                    >
+                      <Send className="w-4 h-4" />
+                    </button>
+                  </div>
+                )}
 
                 {/* Quick helper tip below input */}
                 <div className="mt-2 pt-2 border-t border-slate-100 flex items-center justify-between text-[11px] text-slate-400 px-1">
                   <span>
-                    💡 Dica: Pratique pelo microfone para treinar sua pronúncia; o tutor analisa seu ritmo e gramática.
+                    {isRecordingAudio
+                      ? '🎙️ Gravando sua voz: você pode Pausar para pensar em uma palavra e depois Enviar Áudio direto.'
+                      : '💡 Dica: Grave áudio no 🎙️ (com pausa estilo WhatsApp) para transcrição contextual precisa e avaliação real da sua pronúncia.'}
                   </span>
-                  <span className="hidden sm:inline">Pressione Enter ↵ para enviar</span>
+                  <span className="hidden sm:inline">Enter ↵ para enviar</span>
                 </div>
               </div>
             </div>

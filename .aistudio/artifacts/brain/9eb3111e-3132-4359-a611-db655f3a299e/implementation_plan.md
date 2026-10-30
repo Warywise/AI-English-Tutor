@@ -1,103 +1,46 @@
-# Plano de Aprimoramento de Áudio Bilíngue, Paridade Mobile e Correção do Botão Parar
+# Plano de Implementação: Correção do Envio de Áudio e Remoção Total de Fallbacks Falsos
 
-Este plano resolve os problemas identificados:
-1. **Pronúncia embolada** ao misturar inglês e português no áudio.
-2. **Degradação de voz no celular** para o sintetizador mecânico do Google Tradutor.
-3. **Comportamento do botão "Parar"**, que atualmente reiniciava o áudio do início em vez de interromper a reprodução.
-
----
-
-### User Review & Critical Decisions
-
-> [!IMPORTANT]
-> **Decisões confirmadas e novos itens incorporados:**
-> 1. **Code-Switching com Fonética e Pausas Ajustadas**: O tutor manterá o estilo bilíngue nas falas, com pausas estruturadas e estilo vocal orientado no backend para pronunciar explicações em português brasileiro com clareza, sem fonética anglo-saxônica distorcida.
-> 2. **Paridade Absoluta Mobile vs. PC**: O celular reproduzirá a exata mesma voz neural do desktop (Gemini TTS), desbloqueando o contexto de áudio no toque do botão de envio ou microfone e eliminando o fallback mecânico do Google Tradutor.
-> 3. **Correção do Botão "Parar" (Stop)**: Correção da lógica de interrupção em `handlePlayAudio` — atualmente, o valor de `playbackSpeed` passado como parâmetro anulava a verificação `!customSpeed`, fazendo o player recomeçar do segundo zero em vez de pausar.
+## 1. Diagnóstico do Problema Atual
+1. **Por que o áudio enviava `"Let's talk and practice my English!"`**:
+   - O gravador do navegador (`MediaRecorder`) gera fragmentos `audio/webm;codecs=opus` ou `audio/mp4` a cada 250ms (especialmente ao usar pausa/retomada), formato que frequentemente falha na decodificação multimodal ou retorna transcrição vazia.
+   - No backend (`/api/index.ts` e `/src/server/app.ts`), quando `transcribeAndAnalyzeVoiceAudio` retornava vazio ou falhava, o código executava um fallback silencioso:
+     ```ts
+     if (!effectiveUserMessage) {
+       effectiveUserMessage = "Let's talk and practice my English!";
+     }
+     ```
+2. **Fallbacks Falsos Escondendo Erros da API**:
+   - No backend (`/api/chat`), se os modelos falhassem, havia dois blocos de fallback que retornavam `HTTP 200` fingindo ser o tutor (`"Hey! I heard you loud and clear..."` e `"I heard you! Let's keep going..."`).
+   - No frontend (`/src/App.tsx`), o bloco `catch` de `handleSendMessage` engolia qualquer erro e injetava uma resposta falsa do tutor: `"I heard you! That's a great point. Como você expandiria essa ideia em mais uma frase? Tell me more about it!"`.
 
 ---
 
-### 1. Overview & Core Concept
+## 2. Solução Proposta
 
-- **Objetivo**: Garantir uma experiência de áudio consistente, natural e com controle total do usuário tanto no computador quanto no smartphone.
-- **Público-Alvo**: Estudantes brasileiros que utilizam o app em diferentes dispositivos (celular e desktop) e precisam pausar, repetir ou ouvir explicações com clareza fonética.
-- **Valor Principal**: Conversação agradável, controle instantâneo de play/pause e qualidade de estúdio em qualquer tela.
+### A. Conversão de Áudio para WAV 16kHz Mono no Cliente (`/src/utils/speech.ts`)
+- Ao finalizar a gravação no `VoiceRecorder.stop()`, decodificar os chunks de áudio via `AudioContext.decodeAudioData` e codificar em **WAV padrão (`audio/wav`, 16kHz, 16-bit PCM mono)**.
+- **Vantagens**:
+  - Compatibilidade de 100% com todos os modelos de áudio do Gemini (`gemini-3.5-transcribe`, `gemini-3.8-flash`, `gemini-3.1-flash-lite`), eliminando falhas de container WebM/Opus em celulares e desktops, inclusive após usar **Pausar / Continuar**.
+  - Verificação imediata de volume (RMS/pico) para avisar caso o microfone tenha gravado apenas silêncio absoluto.
 
----
+### B. Transcrição Precisa e Remoção Total de Fallbacks no Backend (`/api/index.ts` e `/src/server/app.ts`)
+- **Configuração correta dos modelos Gemini**:
+  - Atualizar `transcribeAndAnalyzeVoiceAudio` para usar `ThinkingLevel.MINIMAL` / `ThinkingLevel.LOW` (em vez de `thinkingBudget` incompatível com a família Gemini 3) e incluir fallback para o modelo dedicado `gemini-3.5-transcribe` caso o modelo multimodal falhe.
+- **Eliminação de todos os fallbacks silenciosos em `/api/chat` e `/api/transcribe`**:
+  - Remover `effectiveUserMessage = "Let's talk and practice my English!"`.
+  - Remover o bloco `if (!parsedData)` que inventava resposta automática do tutor.
+  - Remover o `catch` que retornava `status(200)` com `"Mensagem recebida"`.
+- **Retorno de erros reais e estruturados**:
+  - Se o áudio não tiver fala compreensível ou a transcrição falhar: retornar **HTTP 422** com `{ error, details, code: 'TRANSCRIPTION_FAILED', stage: 'transcription' }`.
+  - Se a geração da resposta do tutor falhar ou exceder o tempo limite: retornar **HTTP 502/503** com `{ error, details, code: 'TUTOR_API_ERROR', stage: 'chat', userTranscription }` (preservando a transcrição caso o áudio já tenha sido transcrito com sucesso).
 
-### 2. User Experience & Visual Design
-
-- **Controle Preciso de Reprodução (Play / Pause / Stop)**:
-  - Ao tocar em **"Ouvir"**, o botão se transforma imediatamente no estado visual ativo: **"Parar"** (com ícone `VolumeX` e cor de destaque).
-  - Ao clicar em **"Parar"**, o áudio é imediatamente interrompido, o player é zerado e o botão volta ao estado de repouso ("Ouvir").
-  - Ao clicar no botão de velocidade lenta (🐢 0.75x Lento) durante uma reprodução, o áudio alterna para o ritmo lento sem reiniciar inesperadamente.
-
-- **Fluxo Mobile (Toque e Autoplay)**:
-  - O toque do usuário no botão de envio ou microfone executa uma chamada síncrona de desbloqueio (`unlockAudioContext()`).
-  - Quando a resposta do servidor chega com o áudio neural, o navegador móvel (iOS Safari / Android Chrome) executa a reprodução com a mesma voz do PC.
-  - Caso o sistema do celular esteja em modo silencioso físico, o botão de áudio no balão da mensagem permite disparar o áudio manualmente a qualquer momento.
-
----
-
-### 3. Key Product Decisions & Trade-Offs
-
-#### Decisão 1: Correção do Bug do Botão "Parar"
-- **Diagnóstico**: No componente de mensagem (`App.tsx`), o botão chamava `handlePlayAudio(message.id, message.text, message.audioBase64, playbackSpeed)`. Como `playbackSpeed` (ex.: `1.0`) era passado como 4º argumento (`customSpeed`), a verificação `if (currentlyPlayingId === id && !customSpeed)` falhava (pois `!1.0 === false`). Em vez de pausar, o código executava `audioPlayer.play()`, reiniciando a fala do início.
-- **Solução**:
-  - Criar uma função explícita `handleStopAudio()` ou refatorar `handlePlayAudio` para que, se o áudio clicado já for o `currentlyPlayingId` (com a mesma velocidade ou clique direto no botão Parar), execute `audioPlayer.stop()` e resete o estado imediatamente.
-  - Desacoplar a ação de parar da passagem do parâmetro de velocidade padrão.
-
-#### Decisão 2: Fonética Bilíngue e Pausas Naturais
-- **Abordagem Escolhida**:
-  - Refinar o prompt do sistema para orientar o tutor a usar pontuação cadenciada (travessões e quebras) ao fazer transições de idioma.
-  - Ajustar o `speechMetadata` do Gemini TTS (`gemini-3.8-flash-lite-tts`) com a instrução explícita de estilo vocal: `"Conversational bilingual English tutor speaking with Brazilian learners. Natural English pronunciation and authentic Portuguese pronunciation for quick explanations"`.
-  - Normalizar termos em português para evitar que regras fonéticas inglesas gerem pronúncias truncadas.
-
-#### Decisão 3: Paridade Mobile e Remoção do Google Tradutor
-- **Abordagem Escolhida**:
-  - Ampliar o timeout do backend de 4s para 18s em `src/server/app.ts`, garantindo que conexões móveis não descartem o áudio neural.
-  - Implementar o desbloqueador de áudio móvel acionado no toque físico do usuário.
-  - Remover o fallback automático para o `SpeechSynthesis` nativo quando o áudio do Gemini estiver habilitado. Se houver falha de rede, exibir opção de retry com áudio da IA em vez de forçar a voz mecânica do sistema.
-
----
-
-### 4. Technical Architecture & Data Strategy
-
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                        USER ACTIONS (TOUCH & CLICKS)                   │
-│                                                                        │
-│  [Enviar / Mic] ────► unlockAudio() (Libera autoplay em iOS/Android)   │
-│  [Parar]        ────► handleStopAudio() / audioPlayer.stop()           │
-│                       └─► Interrupção imediata, sem reinício           │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-                                    ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│                       BACKEND API (/api/chat)                          │
-│                                                                        │
-│  1. Prompt com cadência bilíngue e pontuação natural                   │
-│  2. Gemini TTS com timeout de 18s (evita queda no mobile)             │
-│  3. speechMetadata orientado para dicção bilíngue clara                │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-                                    ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│                      GLOBAL AUDIO PLAYER (speech.ts)                   │
-│                                                                        │
-│  - Áudio neural WAV base64 do Gemini em HTMLAudioElement               │
-│  - Stop limpo: pause(), currentTime = 0, onEndCallback resetado        │
-│  - Sem fallback forçado para voz robótica do Google Tradutor           │
-└────────────────────────────────────────────────────────────────────────┘
-```
-
-#### Arquivos Envolvidos na Execução:
-1. **`src/App.tsx`**:
-   - Correção do `handlePlayAudio` e implementação de toggle limpo de play/stop.
-   - Chamada de desbloqueio de áudio mobile no envio de mensagens e acionamento do microfone.
-2. **`src/utils/speech.ts`**:
-   - Adição do utilitário `unlockMobileAudio()`.
-   - Limpeza do método `stop()` e desativação do fallback que ativava a voz mecânica do sistema.
-3. **`src/server/app.ts`**:
-   - Aumento do timeout de síntese para 18s.
-   - Instruções de estilo bilíngue no prompt e no `speechMetadata`.
+### C. Estado de Erro Real na Conversa com "Tentar Novamente" e "Editar Texto" (`/src/types.ts`, `/src/components/ChatBubble.tsx`, `/src/App.tsx`)
+- **Remoção da resposta falsa no `catch` de `/src/App.tsx`**:
+  - Nenhuma mensagem fictícia do tutor será adicionada quando ocorrer erro.
+- **Bolha do Usuário com Estado de Falha e Ações Diretas**:
+  - A mensagem ou áudio enviado permanece na conversa marcada com aviso visual de falha contendo o **motivo resumido do erro** (ex: *"Falha na transcrição do áudio: nenhuma fala detectada"* ou *"Erro na API do tutor: tempo limite excedido"*).
+  - **Botão "Tentar novamente"**: Reenvia exatamente o mesmo áudio gravado (ou texto) sem precisar gravar nem digitar de novo.
+  - **Botão "Editar texto"**: Abre um campo ou leva para a barra inferior para você digitar/corrigir manualmente o que queria dizer e enviar como texto.
+  - **Botão "Excluir"**: Remove a tentativa com falha caso queira descartá-la.
+- **Filtro de Histórico**:
+  - Mensagens com estado de erro não resolvido são ignoradas no histórico enviado nas próximas chamadas para não poluir o contexto da conversa.
